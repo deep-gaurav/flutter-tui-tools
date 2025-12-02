@@ -44,15 +44,48 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState) {
                 Style::default()
             };
 
-            // Apply horizontal scrolling (simple truncation/offset for now)
-            // For a proper horizontal scroll, we'd slice the string.
-            // Let's just do a simple slice if offset > 0
-            let display_line = if state.tree_horizontal_scroll > 0 {
-                line.chars()
-                    .skip(state.tree_horizontal_scroll)
-                    .collect::<String>()
+            // Apply horizontal scrolling
+            let line_width = unicode_width::UnicodeWidthStr::width(line.as_str());
+            let visible_width = inner_area.width as usize;
+            let scroll_offset = state.tree_horizontal_scroll;
+
+            let display_line = if scroll_offset >= line_width {
+                ""
             } else {
-                line.clone()
+                let mut current_width = 0;
+                let mut start_byte = 0;
+                let mut end_byte = line.len();
+                let mut found_start = false;
+
+                for (i, c) in line.char_indices() {
+                    let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+
+                    if !found_start {
+                        if current_width + char_width > scroll_offset {
+                            start_byte = i;
+                            found_start = true;
+                            // Reset width to count visible part
+                            current_width = 0;
+                        } else {
+                            current_width += char_width;
+                            continue;
+                        }
+                    }
+
+                    if found_start {
+                        if current_width + char_width > visible_width {
+                            end_byte = i;
+                            break;
+                        }
+                        current_width += char_width;
+                    }
+                }
+
+                if !found_start {
+                    ""
+                } else {
+                    &line[start_byte..end_byte]
+                }
             };
 
             f.buffer_mut()

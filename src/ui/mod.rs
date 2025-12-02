@@ -15,7 +15,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
         .split(chunks[0]);
 
     // Left: Widget Tree

@@ -129,13 +129,14 @@ async fn main() -> Result<()> {
                     KeyCode::Up => match app_state.focus {
                         app_state::Focus::Tree => {
                             app_state.move_selection(-1);
-                            let (_, rows) = terminal
+                            let (cols, rows) = terminal
                                 .size()
                                 .map(|r| (r.width, r.height))
                                 .unwrap_or((0, 0));
                             let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                            let tree_width = (cols as f32 * 0.75) as usize;
                             app_state.update_tree_scroll(tree_height.saturating_sub(2));
-                            // -2 for borders
+                            app_state.ensure_horizontal_visibility(tree_width.saturating_sub(2));
                         }
                         app_state::Focus::Logs => app_state.scroll_logs(-1),
                         _ => {}
@@ -143,32 +144,43 @@ async fn main() -> Result<()> {
                     KeyCode::Down => match app_state.focus {
                         app_state::Focus::Tree => {
                             app_state.move_selection(1);
-                            let (_, rows) = terminal
+                            let (cols, rows) = terminal
                                 .size()
                                 .map(|r| (r.width, r.height))
                                 .unwrap_or((0, 0));
                             let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                            let tree_width = (cols as f32 * 0.75) as usize;
                             app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                            app_state.ensure_horizontal_visibility(tree_width.saturating_sub(2));
                         }
                         app_state::Focus::Logs => app_state.scroll_logs(1),
                         _ => {}
                     },
                     KeyCode::Left => {
                         if app_state.focus == app_state::Focus::Tree {
-                            if !app_state.collapse_selected() {
+                            if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                app_state.scroll_tree_horizontal(-1);
+                            } else if !app_state.collapse_selected() {
                                 app_state.select_parent();
-                                let (_, rows) = terminal
+                                let (cols, rows) = terminal
                                     .size()
                                     .map(|r| (r.width, r.height))
                                     .unwrap_or((0, 0));
                                 let tree_height = (rows as f32 * 0.7) as usize;
+                                let tree_width = (cols as f32 * 0.75) as usize;
                                 app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                app_state
+                                    .ensure_horizontal_visibility(tree_width.saturating_sub(2));
                             }
                         }
                     }
                     KeyCode::Right => {
                         if app_state.focus == app_state::Focus::Tree {
-                            app_state.expand_selected();
+                            if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                app_state.scroll_tree_horizontal(1);
+                            } else {
+                                app_state.expand_selected();
+                            }
                         }
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => {

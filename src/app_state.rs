@@ -256,6 +256,11 @@ impl AppState {
         // rendering will handle empty space.
     }
 
+    pub fn scroll_tree_horizontal(&mut self, delta: isize) {
+        let new_offset = self.tree_horizontal_scroll as isize + delta;
+        self.tree_horizontal_scroll = new_offset.max(0) as usize;
+    }
+
     pub fn add_log(&mut self, message: String) {
         self.logs.push(message);
         // If auto-scroll is on, we don't strictly need to do anything here
@@ -274,6 +279,76 @@ impl AppState {
             if self.log_scroll_state >= self.logs.len().saturating_sub(1) {
                 self.log_auto_scroll = true;
             }
+        }
+    }
+
+    pub fn get_selected_depth(&self) -> usize {
+        if let Some(root) = &self.root_node {
+            let mut current_index = 0;
+            return self
+                .find_depth_at_index(root, &mut current_index, 0)
+                .unwrap_or(0);
+        }
+        0
+    }
+
+    fn find_depth_at_index(
+        &self,
+        node: &RemoteDiagnosticsNode,
+        current_index: &mut usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if *current_index == self.selected_index {
+            return Some(depth);
+        }
+        *current_index += 1;
+
+        if let Some(id) = Self::get_node_id(node) {
+            if self.expanded_ids.contains(&id) {
+                if let Some(children) = &node.children {
+                    for child in children {
+                        if let Some(found) =
+                            self.find_depth_at_index(child, current_index, depth + 1)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn ensure_horizontal_visibility(&mut self, viewport_width: usize) {
+        let depth = self.get_selected_depth();
+        let start_visual_pos = depth * 2; // Assuming 2 spaces per indent
+        let padding = 2;
+
+        if start_visual_pos < self.tree_horizontal_scroll + padding {
+            self.tree_horizontal_scroll = start_visual_pos.saturating_sub(padding);
+        } else if start_visual_pos
+            > self.tree_horizontal_scroll + viewport_width.saturating_sub(padding)
+        {
+            // Scroll right to make it visible, but not too far.
+            // We want start_visual_pos to be visible.
+            // Let's scroll so start_visual_pos is at 1/3 of the screen or just visible?
+            // User said: "not too far right".
+            // Let's try to put it at the left edge + padding.
+            // Wait, if we scroll right, we increase tree_horizontal_scroll.
+            // If start_visual_pos is 100, and scroll is 0, width is 50. 100 > 50.
+            // We want scroll to be such that 100 is visible.
+            // If we set scroll = 100 - width + padding, then 100 is at right edge.
+            // If we set scroll = 100 - padding, then 100 is at left edge.
+            // User wants "intelligently scroll left or right".
+            // "scroll left when user scrolls up... and widget is out of screen" -> implies bringing it into view from left.
+            // "scroll right if user moves to a widget which is tooo far to right" -> implies bringing it into view from right.
+
+            // Let's aim to keep it within the viewport.
+            // If it's off to the right, bring it to the right edge with some padding?
+            // Or maybe center it? No, centering might be too jumpy.
+            // Let's just ensure it's visible.
+
+            self.tree_horizontal_scroll = start_visual_pos + padding + 10 - viewport_width;
         }
     }
 

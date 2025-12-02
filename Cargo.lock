@@ -365,6 +365,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tui-tree-widget",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
