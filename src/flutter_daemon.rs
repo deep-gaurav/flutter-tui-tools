@@ -22,7 +22,7 @@ impl FlutterDaemon {
             .arg("--verbose")
             .current_dir(app_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         if let Some(id) = device_id {
             cmd.arg("-d").arg(id);
@@ -31,6 +31,30 @@ impl FlutterDaemon {
         let mut child = cmd.spawn().context("Failed to spawn fvm flutter attach")?;
 
         let stdout = child.stdout.take().context("Failed to open stdout")?;
+        let stderr = child.stderr.take().context("Failed to open stderr")?;
+
+        // Spawn stderr reader
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            log::error!("Flutter Error: {}", trimmed);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Error reading stderr: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
 
