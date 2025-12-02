@@ -46,6 +46,8 @@ async fn main() -> Result<()> {
     let (tx_uri, mut rx_uri) = mpsc::channel(1);
     let (tx_tree, mut rx_tree) = mpsc::channel(1);
     let (tx_log, mut rx_log) = mpsc::unbounded_channel();
+    let (tx_isolates, mut rx_isolates) = mpsc::channel(1);
+    let (tx_selected_isolate, mut rx_selected_isolate) = mpsc::channel(1);
 
     // Init logger
     logger::init(tx_log)?;
@@ -70,35 +72,55 @@ async fn main() -> Result<()> {
                 log::info!("VM Service Client connected");
                 if let Ok(vm) = client.get_vm().await {
                     log::info!("VM: {:?}", vm);
-                    if let Some(isolate_ref) = vm.isolates.first() {
-                        log::info!("Checking isolate: {}", isolate_ref.name);
-                        // Poll for extension
-                        loop {
-                            if let Ok(isolate) = client.get_isolate(&isolate_ref.id).await {
-                                if let Some(rpcs) = isolate.extension_rpcs {
-                                    if rpcs.contains(
-                                        &"ext.flutter.inspector.getRootWidgetSummaryTree"
-                                            .to_string(),
-                                    ) {
-                                        log::info!("Inspector extension found!");
-                                        break;
+
+                    // Send isolates to UI
+                    if !vm.isolates.is_empty() {
+                        let _ = tx_isolates.send(vm.isolates.clone()).await;
+
+                        // Wait for selection
+                        while let Some(selected_id) = rx_selected_isolate.recv().await {
+                            if let Some(isolate_ref) =
+                                vm.isolates.iter().find(|i| i.id == selected_id)
+                            {
+                                log::info!("Checking isolate: {}", isolate_ref.name);
+                                // Poll for extension
+                                loop {
+                                    if let Ok(isolate) = client.get_isolate(&isolate_ref.id).await {
+                                        if let Some(rpcs) = isolate.extension_rpcs {
+                                            if rpcs.contains(
+                                                &"ext.flutter.inspector.getRootWidgetSummaryTree"
+                                                    .to_string(),
+                                            ) {
+                                                log::info!("Inspector extension found!");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    log::info!("Waiting for inspector extension...");
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+
+                                match client
+                                    .get_root_widget_summary_tree("tui_inspector", &isolate_ref.id)
+                                    .await
+                                {
+                                    Ok(tree) => {
+                                        log::info!(
+                                            "Root Widget fetched: {:?}",
+                                            tree.widget_runtime_type
+                                        );
+                                        let _ = tx_tree.send(tree).await;
+                                        // Success, we can break or stay connected for updates?
+                                        // For now, if we want to allow re-selection on failure, we need to handle failure.
+                                        // But here we succeeded.
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to fetch tree: {}", e);
+                                        // If failed, maybe we should ask user to select again?
+                                        // Send isolates again to trigger popup?
+                                        let _ = tx_isolates.send(vm.isolates.clone()).await;
                                     }
                                 }
-                            }
-                            log::info!("Waiting for inspector extension...");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-
-                        match client
-                            .get_root_widget_summary_tree("tui_inspector", &isolate_ref.id)
-                            .await
-                        {
-                            Ok(tree) => {
-                                log::info!("Root Widget fetched: {:?}", tree.widget_runtime_type);
-                                let _ = tx_tree.send(tree).await;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to fetch tree: {}", e);
                             }
                         }
                     }
@@ -115,6 +137,17 @@ async fn main() -> Result<()> {
             app_state.connection_status = "Connected".to_string();
         }
 
+        if let Ok(isolates) = rx_isolates.try_recv() {
+            app_state.available_isolates = isolates;
+            if app_state.available_isolates.len() > 1 {
+                app_state.show_isolate_selection = true;
+                app_state.focus = app_state::Focus::IsolateSelection;
+            } else if let Some(first) = app_state.available_isolates.first() {
+                // Auto-select if only one
+                let _ = tx_selected_isolate.send(first.id.clone()).await;
+            }
+        }
+
         while let Ok(log_entry) = rx_log.try_recv() {
             app_state.add_log(log_entry);
         }
@@ -123,146 +156,163 @@ async fn main() -> Result<()> {
 
         if crossterm::event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Tab => app_state.cycle_focus(),
-                    KeyCode::Up => match app_state.focus {
-                        app_state::Focus::Tree => {
-                            app_state.move_selection(-1);
-                            let (cols, rows) = terminal
-                                .size()
-                                .map(|r| (r.width, r.height))
-                                .unwrap_or((0, 0));
-                            let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
-                            let tree_width = (cols as f32 * 0.75) as usize;
-                            app_state.update_tree_scroll(tree_height.saturating_sub(2));
-                            app_state.ensure_horizontal_visibility(tree_width.saturating_sub(2));
+                Event::Key(key) => {
+                    if app_state.show_isolate_selection {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Up => app_state.move_isolate_selection(-1),
+                            KeyCode::Down => app_state.move_isolate_selection(1),
+                            KeyCode::Enter => {
+                                if let Some(isolate) = app_state
+                                    .available_isolates
+                                    .get(app_state.selected_isolate_index)
+                                {
+                                    let _ = tx_selected_isolate.send(isolate.id.clone()).await;
+                                    app_state.show_isolate_selection = false;
+                                    app_state.focus = app_state::Focus::Tree;
+                                }
+                            }
+                            _ => {}
                         }
-                        app_state::Focus::Logs => app_state.scroll_logs(-1),
-                        _ => {}
-                    },
-                    KeyCode::Down => match app_state.focus {
-                        app_state::Focus::Tree => {
-                            app_state.move_selection(1);
-                            let (cols, rows) = terminal
-                                .size()
-                                .map(|r| (r.width, r.height))
-                                .unwrap_or((0, 0));
-                            let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
-                            let tree_width = (cols as f32 * 0.75) as usize;
-                            app_state.update_tree_scroll(tree_height.saturating_sub(2));
-                            app_state.ensure_horizontal_visibility(tree_width.saturating_sub(2));
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Tab => app_state.cycle_focus(),
+                            KeyCode::Up => match app_state.focus {
+                                app_state::Focus::Tree => {
+                                    app_state.move_selection(-1);
+                                    let (cols, rows) = terminal
+                                        .size()
+                                        .map(|r| (r.width, r.height))
+                                        .unwrap_or((0, 0));
+                                    let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                                    let tree_width = (cols as f32 * 0.75) as usize;
+                                    app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                    app_state
+                                        .ensure_horizontal_visibility(tree_width.saturating_sub(2));
+                                }
+                                app_state::Focus::Logs => app_state.scroll_logs(-1),
+                                _ => {}
+                            },
+                            KeyCode::Down => match app_state.focus {
+                                app_state::Focus::Tree => {
+                                    app_state.move_selection(1);
+                                    let (cols, rows) = terminal
+                                        .size()
+                                        .map(|r| (r.width, r.height))
+                                        .unwrap_or((0, 0));
+                                    let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                                    let tree_width = (cols as f32 * 0.75) as usize;
+                                    app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                    app_state
+                                        .ensure_horizontal_visibility(tree_width.saturating_sub(2));
+                                }
+                                app_state::Focus::Logs => app_state.scroll_logs(1),
+                                _ => {}
+                            },
+                            KeyCode::Left => {
+                                if app_state.focus == app_state::Focus::Tree {
+                                    if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                        app_state.scroll_tree_horizontal(-1);
+                                    } else if !app_state.collapse_selected() {
+                                        app_state.select_parent();
+                                        let (cols, rows) = terminal
+                                            .size()
+                                            .map(|r| (r.width, r.height))
+                                            .unwrap_or((0, 0));
+                                        let tree_height = (rows as f32 * 0.7) as usize;
+                                        let tree_width = (cols as f32 * 0.75) as usize;
+                                        app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                        app_state.ensure_horizontal_visibility(
+                                            tree_width.saturating_sub(2),
+                                        );
+                                    }
+                                }
+                            }
+                            KeyCode::Right => {
+                                if app_state.focus == app_state::Focus::Tree {
+                                    if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                        app_state.scroll_tree_horizontal(1);
+                                    } else {
+                                        app_state.expand_selected();
+                                    }
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                if app_state.focus == app_state::Focus::Tree {
+                                    app_state.toggle_expand();
+                                }
+                            }
+                            KeyCode::PageUp => app_state.scroll_logs(-10),
+                            KeyCode::PageDown => app_state.scroll_logs(10),
+                            _ => {}
                         }
-                        app_state::Focus::Logs => app_state.scroll_logs(1),
-                        _ => {}
-                    },
-                    KeyCode::Left => {
-                        if app_state.focus == app_state::Focus::Tree {
-                            if key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                                app_state.scroll_tree_horizontal(-1);
-                            } else if !app_state.collapse_selected() {
-                                app_state.select_parent();
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if !app_state.show_isolate_selection {
+                        match mouse.kind {
+                            event::MouseEventKind::Down(event::MouseButton::Left) => {
                                 let (cols, rows) = terminal
                                     .size()
                                     .map(|r| (r.width, r.height))
                                     .unwrap_or((0, 0));
-                                let tree_height = (rows as f32 * 0.7) as usize;
-                                let tree_width = (cols as f32 * 0.75) as usize;
-                                app_state.update_tree_scroll(tree_height.saturating_sub(2));
-                                app_state
-                                    .ensure_horizontal_visibility(tree_width.saturating_sub(2));
-                            }
-                        }
-                    }
-                    KeyCode::Right => {
-                        if app_state.focus == app_state::Focus::Tree {
-                            if key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                                app_state.scroll_tree_horizontal(1);
-                            } else {
-                                app_state.expand_selected();
-                            }
-                        }
-                    }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        if app_state.focus == app_state::Focus::Tree {
-                            app_state.toggle_expand();
-                        }
-                    }
-                    KeyCode::PageUp => app_state.scroll_logs(-10),
-                    KeyCode::PageDown => app_state.scroll_logs(10),
-                    _ => {}
-                },
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        event::MouseEventKind::Down(event::MouseButton::Left) => {
-                            let (cols, rows) = terminal
-                                .size()
-                                .map(|r| (r.width, r.height))
-                                .unwrap_or((0, 0));
-                            // Layout:
-                            // Vertical: 70% Top, 30% Bottom
-                            // Top: 50% Left, 50% Right
-                            let split_y = (rows as f32 * 0.7) as u16;
-                            let split_x = (cols as f32 * 0.5) as u16;
+                                // Layout:
+                                // Vertical: 70% Top, 30% Bottom
+                                // Top: 50% Left, 50% Right
+                                let split_y = (rows as f32 * 0.7) as u16;
+                                let split_x = (cols as f32 * 0.5) as u16;
 
-                            if mouse.row < split_y {
-                                if mouse.column < split_x {
-                                    app_state.focus = app_state::Focus::Tree;
-                                    // Handle tree click
-                                    let tree_y = mouse.row.saturating_sub(1); // -1 for top border
-                                    if tree_y < split_y.saturating_sub(2) {
-                                        // Check if within content area
-                                        let clicked_index =
-                                            tree_y as usize + app_state.tree_scroll_offset;
-                                        if clicked_index < app_state.visible_count() {
-                                            app_state.selected_index = clicked_index;
-                                            // Check if clicked on arrow (approximate check)
-                                            // We don't know exact indentation here easily without re-calculating.
-                                            // But we can just toggle if double clicked or something?
-                                            // Or just toggle if clicked?
-                                            // Let's just select for now.
-                                            // If we want to support click-to-toggle, we'd need to know if the click was on the arrow.
-                                            // For now, let's just make click select.
-                                            // Maybe double click to toggle? MouseEvent doesn't give double click easily.
-                                            // Let's stick to selection on click.
+                                if mouse.row < split_y {
+                                    if mouse.column < split_x {
+                                        app_state.focus = app_state::Focus::Tree;
+                                        // Handle tree click
+                                        let tree_y = mouse.row.saturating_sub(1); // -1 for top border
+                                        if tree_y < split_y.saturating_sub(2) {
+                                            // Check if within content area
+                                            let clicked_index =
+                                                tree_y as usize + app_state.tree_scroll_offset;
+                                            if clicked_index < app_state.visible_count() {
+                                                app_state.selected_index = clicked_index;
+                                            }
                                         }
+                                    } else {
+                                        app_state.focus = app_state::Focus::Details;
                                     }
                                 } else {
-                                    app_state.focus = app_state::Focus::Details;
+                                    app_state.focus = app_state::Focus::Logs;
                                 }
-                            } else {
-                                app_state.focus = app_state::Focus::Logs;
                             }
-                        }
-                        event::MouseEventKind::ScrollDown => {
-                            let (cols, rows) = terminal
-                                .size()
-                                .map(|r| (r.width, r.height))
-                                .unwrap_or((0, 0));
-                            let split_y = (rows as f32 * 0.7) as u16;
-                            let split_x = (cols as f32 * 0.5) as u16;
+                            event::MouseEventKind::ScrollDown => {
+                                let (cols, rows) = terminal
+                                    .size()
+                                    .map(|r| (r.width, r.height))
+                                    .unwrap_or((0, 0));
+                                let split_y = (rows as f32 * 0.7) as u16;
+                                let split_x = (cols as f32 * 0.5) as u16;
 
-                            if mouse.row >= split_y {
-                                app_state.scroll_logs(1);
-                            } else if mouse.row < split_y && mouse.column < split_x {
-                                app_state.scroll_tree(1);
+                                if mouse.row >= split_y {
+                                    app_state.scroll_logs(1);
+                                } else if mouse.row < split_y && mouse.column < split_x {
+                                    app_state.scroll_tree(1);
+                                }
                             }
-                        }
-                        event::MouseEventKind::ScrollUp => {
-                            let (cols, rows) = terminal
-                                .size()
-                                .map(|r| (r.width, r.height))
-                                .unwrap_or((0, 0));
-                            let split_y = (rows as f32 * 0.7) as u16;
-                            let split_x = (cols as f32 * 0.5) as u16;
+                            event::MouseEventKind::ScrollUp => {
+                                let (cols, rows) = terminal
+                                    .size()
+                                    .map(|r| (r.width, r.height))
+                                    .unwrap_or((0, 0));
+                                let split_y = (rows as f32 * 0.7) as u16;
+                                let split_x = (cols as f32 * 0.5) as u16;
 
-                            if mouse.row >= split_y {
-                                app_state.scroll_logs(-1);
-                            } else if mouse.row < split_y && mouse.column < split_x {
-                                app_state.scroll_tree(-1);
+                                if mouse.row >= split_y {
+                                    app_state.scroll_logs(-1);
+                                } else if mouse.row < split_y && mouse.column < split_x {
+                                    app_state.scroll_tree(-1);
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 _ => {}

@@ -61,4 +61,68 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
     let logs_list = ratatui::widgets::List::new(logs).block(log_block);
     f.render_widget(logs_list, log_area);
+
+    // Isolate Selection Popup
+    if state.show_isolate_selection {
+        draw_isolate_selection_popup(f, state);
+    }
+}
+
+fn draw_isolate_selection_popup(f: &mut Frame, state: &AppState) {
+    let area = centered_rect(60, 40, f.area());
+    let block = ratatui::widgets::Block::default()
+        .title("Select Isolate")
+        .borders(ratatui::widgets::Borders::ALL)
+        .style(ratatui::style::Style::default().bg(ratatui::style::Color::DarkGray));
+
+    f.render_widget(ratatui::widgets::Clear, area); // Clear background
+    f.render_widget(block.clone(), area);
+
+    let items: Vec<ratatui::widgets::ListItem> = state
+        .available_isolates
+        .iter()
+        .map(|iso| {
+            let content = format!("{} ({})", iso.name, iso.id);
+            ratatui::widgets::ListItem::new(content)
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items)
+        .block(ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::NONE))
+        .highlight_style(
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(ratatui::style::Color::White),
+        )
+        .highlight_symbol(">> ");
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(state.selected_isolate_index));
+
+    let inner_area = block.inner(area);
+    f.render_stateful_widget(list, inner_area, &mut list_state);
+}
+
+fn centered_rect(
+    percent_x: u16,
+    percent_y: u16,
+    r: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }

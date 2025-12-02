@@ -34,7 +34,7 @@ pub struct VM {
     pub isolates: Vec<IsolateRef>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IsolateRef {
     pub id: String,
     pub name: String,

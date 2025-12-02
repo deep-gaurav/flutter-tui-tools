@@ -6,11 +6,17 @@ pub enum Focus {
     Tree,
     Details,
     Logs,
+    IsolateSelection,
 }
 
 pub struct AppState {
     pub root_node: Option<RemoteDiagnosticsNode>,
     pub connection_status: String,
+
+    // Isolate Selection State
+    pub available_isolates: Vec<crate::vm_service::IsolateRef>,
+    pub show_isolate_selection: bool,
+    pub selected_isolate_index: usize,
 
     // Tree State
     pub selected_index: usize,
@@ -31,6 +37,9 @@ impl AppState {
         Self {
             root_node: None,
             connection_status: "Connecting...".to_string(),
+            available_isolates: Vec::new(),
+            show_isolate_selection: false,
+            selected_isolate_index: 0,
             selected_index: 0,
             expanded_ids: HashSet::new(),
             tree_scroll_offset: 0,
@@ -353,10 +362,28 @@ impl AppState {
     }
 
     pub fn cycle_focus(&mut self) {
+        if self.show_isolate_selection {
+            return; // Lock focus when selecting isolate
+        }
         self.focus = match self.focus {
             Focus::Tree => Focus::Details,
             Focus::Details => Focus::Logs,
             Focus::Logs => Focus::Tree,
+            Focus::IsolateSelection => Focus::IsolateSelection, // Should not happen if locked
         };
+    }
+
+    pub fn move_isolate_selection(&mut self, delta: isize) {
+        if self.available_isolates.is_empty() {
+            return;
+        }
+        let new_index = self.selected_isolate_index as isize + delta;
+        if new_index < 0 {
+            self.selected_isolate_index = 0;
+        } else if new_index >= self.available_isolates.len() as isize {
+            self.selected_isolate_index = self.available_isolates.len() - 1;
+        } else {
+            self.selected_isolate_index = new_index as usize;
+        }
     }
 }
