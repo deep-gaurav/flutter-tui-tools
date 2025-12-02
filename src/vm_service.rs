@@ -79,7 +79,9 @@ impl VmServiceClient {
         while let Some(msg) = self.ws_stream.next().await {
             let msg = msg?;
             if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
-                let response: Value = serde_json::from_str(&text)?;
+                let mut deserializer = serde_json::Deserializer::from_str(&text);
+                deserializer.disable_recursion_limit();
+                let response: Value = Value::deserialize(&mut deserializer)?;
                 if let Some(id) = response.get("id") {
                     if id.as_u64() == Some(self.request_id) {
                         if let Some(result) = response.get("result") {
