@@ -1,5 +1,12 @@
 use crate::vm_service::RemoteDiagnosticsNode;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Focus {
+    Tree,
+    Details,
+    Logs,
+}
+
 pub struct AppState {
     pub root_node: Option<RemoteDiagnosticsNode>,
     pub connection_status: String,
@@ -13,6 +20,12 @@ pub struct AppState {
     // Or just rebuild the flat list every draw?
     // Rebuilding every draw is fine for TUI frame rates.
     pub selected_index: usize,
+
+    pub logs: Vec<String>,
+    pub log_scroll_state: usize, // Index of the first visible log line (or offset)
+    pub log_auto_scroll: bool,
+
+    pub focus: Focus,
 }
 
 impl AppState {
@@ -21,6 +34,10 @@ impl AppState {
             root_node: None,
             connection_status: "Connecting...".to_string(),
             selected_index: 0,
+            logs: Vec::new(),
+            log_scroll_state: 0,
+            log_auto_scroll: true,
+            focus: Focus::Tree,
         }
     }
 
@@ -65,5 +82,43 @@ impl AppState {
         } else {
             self.selected_index = new_index as usize;
         }
+    }
+
+    pub fn add_log(&mut self, message: String) {
+        self.logs.push(message);
+        if self.log_auto_scroll {
+            // We'll calculate the correct offset during rendering or just set it to a large number
+            // and let the UI clamp it. Or simpler: just track if we are at the bottom.
+            // For now, let's just say if auto-scroll is on, we don't change scroll_state manually here,
+            // but the UI will use logs.len() - height.
+            // Actually, let's just store the index of the *first* visible line.
+            // If auto-scroll is on, we'll update it in the UI draw or here if we knew the height.
+            // Since we don't know height here, let's just use a flag.
+        }
+    }
+
+    pub fn scroll_logs(&mut self, delta: isize) {
+        if delta < 0 {
+            self.log_auto_scroll = false;
+            let new_scroll = self.log_scroll_state as isize + delta;
+            self.log_scroll_state = new_scroll.max(0) as usize;
+        } else {
+            let new_scroll = self.log_scroll_state as isize + delta;
+            // We can't clamp to max without knowing height, but we can clamp to logs.len()
+            self.log_scroll_state = (new_scroll as usize).min(self.logs.len().saturating_sub(1));
+
+            // Re-enable auto-scroll if we hit the bottom
+            if self.log_scroll_state >= self.logs.len().saturating_sub(1) {
+                self.log_auto_scroll = true;
+            }
+        }
+    }
+
+    pub fn cycle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Tree => Focus::Details,
+            Focus::Details => Focus::Logs,
+            Focus::Logs => Focus::Tree,
+        };
     }
 }

@@ -8,7 +8,15 @@ use ratatui::{
 };
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().title("Widget Tree").borders(Borders::ALL);
+    let border_style = if state.focus == crate::app_state::Focus::Tree {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let block = Block::default()
+        .title("Widget Tree")
+        .borders(Borders::ALL)
+        .border_style(border_style);
     f.render_widget(block, area);
 
     let inner_area = area.inner(ratatui::layout::Margin {

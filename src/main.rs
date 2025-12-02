@@ -1,5 +1,6 @@
 mod app_state;
 mod flutter_daemon;
+mod logger;
 mod ui;
 mod vm_service;
 
@@ -40,14 +41,14 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Init logger
-    tui_logger::init_logger(log::LevelFilter::Info).unwrap();
-    tui_logger::set_default_level(log::LevelFilter::Info);
-
     // Create app state
     let mut app_state = AppState::new();
     let (tx_uri, mut rx_uri) = mpsc::channel(1);
     let (tx_tree, mut rx_tree) = mpsc::channel(1);
+    let (tx_log, mut rx_log) = mpsc::unbounded_channel();
+
+    // Init logger
+    logger::init(tx_log)?;
 
     // Start Flutter Daemon
     let daemon = FlutterDaemon::new(tx_uri);
@@ -114,16 +115,86 @@ async fn main() -> Result<()> {
             app_state.connection_status = "Connected".to_string();
         }
 
+        while let Ok(log_entry) = rx_log.try_recv() {
+            app_state.add_log(log_entry);
+        }
+
         terminal.draw(|f| ui::draw(f, &app_state))?;
 
         if crossterm::event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
+            match event::read()? {
+                Event::Key(key) => match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Up => app_state.move_selection(-1),
-                    KeyCode::Down => app_state.move_selection(1),
+                    KeyCode::Tab => app_state.cycle_focus(),
+                    KeyCode::Up => match app_state.focus {
+                        app_state::Focus::Tree => app_state.move_selection(-1),
+                        app_state::Focus::Logs => app_state.scroll_logs(-1),
+                        _ => {}
+                    },
+                    KeyCode::Down => match app_state.focus {
+                        app_state::Focus::Tree => app_state.move_selection(1),
+                        app_state::Focus::Logs => app_state.scroll_logs(1),
+                        _ => {}
+                    },
+                    KeyCode::PageUp => app_state.scroll_logs(-10),
+                    KeyCode::PageDown => app_state.scroll_logs(10),
                     _ => {}
+                },
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        event::MouseEventKind::Down(event::MouseButton::Left) => {
+                            let (cols, rows) = terminal
+                                .size()
+                                .map(|r| (r.width, r.height))
+                                .unwrap_or((0, 0));
+                            // Layout:
+                            // Vertical: 70% Top, 30% Bottom
+                            // Top: 50% Left, 50% Right
+                            let split_y = (rows as f32 * 0.7) as u16;
+                            let split_x = (cols as f32 * 0.5) as u16;
+
+                            if mouse.row < split_y {
+                                if mouse.column < split_x {
+                                    app_state.focus = app_state::Focus::Tree;
+                                } else {
+                                    app_state.focus = app_state::Focus::Details;
+                                }
+                            } else {
+                                app_state.focus = app_state::Focus::Logs;
+                            }
+                        }
+                        event::MouseEventKind::ScrollDown => {
+                            let (cols, rows) = terminal
+                                .size()
+                                .map(|r| (r.width, r.height))
+                                .unwrap_or((0, 0));
+                            let split_y = (rows as f32 * 0.7) as u16;
+                            let split_x = (cols as f32 * 0.5) as u16;
+
+                            if mouse.row >= split_y {
+                                app_state.scroll_logs(1);
+                            } else if mouse.row < split_y && mouse.column < split_x {
+                                app_state.move_selection(1);
+                            }
+                        }
+                        event::MouseEventKind::ScrollUp => {
+                            let (cols, rows) = terminal
+                                .size()
+                                .map(|r| (r.width, r.height))
+                                .unwrap_or((0, 0));
+                            let split_y = (rows as f32 * 0.7) as u16;
+                            let split_x = (cols as f32 * 0.5) as u16;
+
+                            if mouse.row >= split_y {
+                                app_state.scroll_logs(-1);
+                            } else if mouse.row < split_y && mouse.column < split_x {
+                                app_state.move_selection(-1);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+                _ => {}
             }
         }
     }

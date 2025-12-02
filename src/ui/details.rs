@@ -6,7 +6,15 @@ use ratatui::{
 };
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().title("Details").borders(Borders::ALL);
+    let border_style = if state.focus == crate::app_state::Focus::Details {
+        ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)
+    } else {
+        ratatui::style::Style::default()
+    };
+    let block = Block::default()
+        .title("Details")
+        .borders(Borders::ALL)
+        .border_style(border_style);
 
     let content = if let Some(root) = &state.root_node {
         // Re-flatten to find the selected node by index
