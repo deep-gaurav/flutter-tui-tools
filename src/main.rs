@@ -127,15 +127,55 @@ async fn main() -> Result<()> {
                     KeyCode::Char('q') => break,
                     KeyCode::Tab => app_state.cycle_focus(),
                     KeyCode::Up => match app_state.focus {
-                        app_state::Focus::Tree => app_state.move_selection(-1),
+                        app_state::Focus::Tree => {
+                            app_state.move_selection(-1);
+                            let (_, rows) = terminal
+                                .size()
+                                .map(|r| (r.width, r.height))
+                                .unwrap_or((0, 0));
+                            let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                            app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                            // -2 for borders
+                        }
                         app_state::Focus::Logs => app_state.scroll_logs(-1),
                         _ => {}
                     },
                     KeyCode::Down => match app_state.focus {
-                        app_state::Focus::Tree => app_state.move_selection(1),
+                        app_state::Focus::Tree => {
+                            app_state.move_selection(1);
+                            let (_, rows) = terminal
+                                .size()
+                                .map(|r| (r.width, r.height))
+                                .unwrap_or((0, 0));
+                            let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                            app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                        }
                         app_state::Focus::Logs => app_state.scroll_logs(1),
                         _ => {}
                     },
+                    KeyCode::Left => {
+                        if app_state.focus == app_state::Focus::Tree {
+                            if !app_state.collapse_selected() {
+                                app_state.select_parent();
+                                let (_, rows) = terminal
+                                    .size()
+                                    .map(|r| (r.width, r.height))
+                                    .unwrap_or((0, 0));
+                                let tree_height = (rows as f32 * 0.7) as usize;
+                                app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                            }
+                        }
+                    }
+                    KeyCode::Right => {
+                        if app_state.focus == app_state::Focus::Tree {
+                            app_state.expand_selected();
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        if app_state.focus == app_state::Focus::Tree {
+                            app_state.toggle_expand();
+                        }
+                    }
                     KeyCode::PageUp => app_state.scroll_logs(-10),
                     KeyCode::PageDown => app_state.scroll_logs(10),
                     _ => {}
@@ -156,6 +196,25 @@ async fn main() -> Result<()> {
                             if mouse.row < split_y {
                                 if mouse.column < split_x {
                                     app_state.focus = app_state::Focus::Tree;
+                                    // Handle tree click
+                                    let tree_y = mouse.row.saturating_sub(1); // -1 for top border
+                                    if tree_y < split_y.saturating_sub(2) {
+                                        // Check if within content area
+                                        let clicked_index =
+                                            tree_y as usize + app_state.tree_scroll_offset;
+                                        if clicked_index < app_state.visible_count() {
+                                            app_state.selected_index = clicked_index;
+                                            // Check if clicked on arrow (approximate check)
+                                            // We don't know exact indentation here easily without re-calculating.
+                                            // But we can just toggle if double clicked or something?
+                                            // Or just toggle if clicked?
+                                            // Let's just select for now.
+                                            // If we want to support click-to-toggle, we'd need to know if the click was on the arrow.
+                                            // For now, let's just make click select.
+                                            // Maybe double click to toggle? MouseEvent doesn't give double click easily.
+                                            // Let's stick to selection on click.
+                                        }
+                                    }
                                 } else {
                                     app_state.focus = app_state::Focus::Details;
                                 }
@@ -174,7 +233,7 @@ async fn main() -> Result<()> {
                             if mouse.row >= split_y {
                                 app_state.scroll_logs(1);
                             } else if mouse.row < split_y && mouse.column < split_x {
-                                app_state.move_selection(1);
+                                app_state.scroll_tree(1);
                             }
                         }
                         event::MouseEventKind::ScrollUp => {
@@ -188,7 +247,7 @@ async fn main() -> Result<()> {
                             if mouse.row >= split_y {
                                 app_state.scroll_logs(-1);
                             } else if mouse.row < split_y && mouse.column < split_x {
-                                app_state.move_selection(-1);
+                                app_state.scroll_tree(-1);
                             }
                         }
                         _ => {}

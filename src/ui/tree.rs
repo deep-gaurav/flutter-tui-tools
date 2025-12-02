@@ -27,21 +27,36 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState) {
     if let Some(root) = &state.root_node {
         let mut lines = Vec::new();
         let mut visible_nodes = Vec::new();
-        flatten_tree(root, 0, &mut lines, &mut visible_nodes);
+        flatten_tree(root, 0, &mut lines, &mut visible_nodes, &state.expanded_ids);
 
-        for (i, line) in lines.iter().enumerate() {
+        // Apply scrolling
+        let skip_count = state.tree_scroll_offset;
+
+        for (i, line) in lines.iter().skip(skip_count).enumerate() {
             if i >= inner_area.height as usize {
                 break;
             }
 
-            let style = if i == state.selected_index {
+            let actual_index = i + skip_count;
+            let style = if actual_index == state.selected_index {
                 Style::default().bg(Color::Blue).fg(Color::White)
             } else {
                 Style::default()
             };
 
+            // Apply horizontal scrolling (simple truncation/offset for now)
+            // For a proper horizontal scroll, we'd slice the string.
+            // Let's just do a simple slice if offset > 0
+            let display_line = if state.tree_horizontal_scroll > 0 {
+                line.chars()
+                    .skip(state.tree_horizontal_scroll)
+                    .collect::<String>()
+            } else {
+                line.clone()
+            };
+
             f.buffer_mut()
-                .set_string(inner_area.x, inner_area.y + i as u16, line, style);
+                .set_string(inner_area.x, inner_area.y + i as u16, display_line, style);
         }
     } else {
         f.buffer_mut().set_string(
@@ -58,6 +73,7 @@ fn flatten_tree<'a>(
     depth: usize,
     lines: &mut Vec<String>,
     nodes: &mut Vec<&'a RemoteDiagnosticsNode>,
+    expanded_ids: &std::collections::HashSet<String>,
 ) {
     let indent = "  ".repeat(depth);
     let description = node.description.as_deref().unwrap_or("?");
@@ -66,12 +82,39 @@ fn flatten_tree<'a>(
         .as_deref()
         .unwrap_or(node.node_type.as_deref().unwrap_or("Unknown"));
 
-    lines.push(format!("{}{} ({})", indent, type_name, description));
+    // Determine icon
+    let has_children = node
+        .children
+        .as_ref()
+        .map(|c| !c.is_empty())
+        .unwrap_or(false);
+    let is_expanded = if let Some(id) = node.value_id.as_ref().or(node.object_id.as_ref()) {
+        expanded_ids.contains(id)
+    } else {
+        true // Default to expanded if no ID? Or collapsed? Let's say expanded for now to be safe.
+    };
+
+    let icon = if has_children {
+        if is_expanded {
+            "▼ "
+        } else {
+            "▶ "
+        }
+    } else {
+        "  " // Placeholder for alignment
+    };
+
+    lines.push(format!(
+        "{}{}{}{} ({})",
+        indent, icon, type_name, "", description
+    ));
     nodes.push(node);
 
-    if let Some(children) = &node.children {
-        for child in children {
-            flatten_tree(child, depth + 1, lines, nodes);
+    if has_children && is_expanded {
+        if let Some(children) = &node.children {
+            for child in children {
+                flatten_tree(child, depth + 1, lines, nodes, expanded_ids);
+            }
         }
     }
 }
