@@ -74,9 +74,31 @@ impl AppState {
 
     pub fn expand_selected(&mut self) {
         if let Some(node) = self.get_selected_node() {
-            if let Some(id) = Self::get_node_id(node) {
-                if !self.expanded_ids.contains(&id) {
-                    self.expanded_ids.insert(id);
+            // We need to clone the node or IDs to avoid borrowing issues while mutating self.expanded_ids
+            // But we can't clone RemoteDiagnosticsNode easily if it's large, but it's just data.
+            // Actually, we just need to collect IDs to expand.
+            let mut ids_to_expand = Vec::new();
+            Self::collect_smart_expand_ids(node, &mut ids_to_expand, 5);
+
+            for id in ids_to_expand {
+                self.expanded_ids.insert(id);
+            }
+        }
+    }
+
+    fn collect_smart_expand_ids(
+        node: &RemoteDiagnosticsNode,
+        ids: &mut Vec<String>,
+        depth_limit: usize,
+    ) {
+        if let Some(id) = Self::get_node_id(node) {
+            ids.push(id);
+
+            if depth_limit > 0 {
+                if let Some(children) = &node.children {
+                    if children.len() == 1 {
+                        Self::collect_smart_expand_ids(&children[0], ids, depth_limit - 1);
+                    }
                 }
             }
         }
