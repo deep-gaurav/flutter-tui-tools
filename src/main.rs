@@ -52,7 +52,10 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app state
-    let mut app_state = AppState::new(std::path::PathBuf::from(&args.app_dir));
+    let project_root = std::path::PathBuf::from(&args.app_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&args.app_dir));
+    let mut app_state = AppState::new(project_root);
     let (tx_uri, mut rx_uri) = mpsc::channel(1);
     let (tx_tree, mut rx_tree) = mpsc::channel(1);
     let (tx_log, mut rx_log) = mpsc::unbounded_channel();
@@ -147,16 +150,22 @@ async fn main() -> Result<()> {
                 // Subscribe to streams
                 if let Err(e) = client.stream_listen("Debug").await {
                     log::error!("Failed to subscribe to Debug stream: {}", e);
+                } else {
+                    log::info!("Subscribed to Debug stream");
                 }
                 if let Err(e) = client.stream_listen("Isolate").await {
                     log::error!("Failed to subscribe to Isolate stream: {}", e);
+                } else {
+                    log::info!("Subscribed to Isolate stream");
                 }
                 if let Err(e) = client.stream_listen("Extension").await {
                     log::error!("Failed to subscribe to Extension stream: {}", e);
+                } else {
+                    log::info!("Subscribed to Extension stream");
                 }
 
                 if let Ok(vm) = client.get_vm().await {
-                    log::info!("VM: {:?}", vm);
+                    log::info!("VM fetched: isolates count = {}", vm.isolates.len());
 
                     // Send isolates to UI
                     if !vm.isolates.is_empty() {
@@ -164,6 +173,7 @@ async fn main() -> Result<()> {
 
                         // Wait for selection
                         let mut current_isolate_id: Option<String> = None;
+                        log::info!("Starting VM Event Loop");
 
                         loop {
                             tokio::select! {
@@ -192,40 +202,49 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 Some(selected_id) = rx_selected_isolate.recv() => {
+                                    log::info!("VM Task: Received selected isolate ID: {}", selected_id);
                                     if let Some(isolate_ref) = vm.isolates.iter().find(|i| i.id == selected_id) {
                                         log::info!("Checking isolate: {}", isolate_ref.name);
                                         current_isolate_id = Some(isolate_ref.id.clone());
 
-                                        // Poll for extension
-                                        loop {
-                                            if let Ok(isolate) = client.get_isolate(&isolate_ref.id).await {
-                                                if let Some(rpcs) = isolate.extension_rpcs {
-                                                    if rpcs.contains(
-                                                        &"ext.flutter.inspector.getRootWidgetSummaryTree"
-                                                            .to_string(),
-                                                    ) {
-                                                        log::info!("Inspector extension found!");
-                                                        break;
+                                        let client = client.clone();
+                                        let isolate_ref = isolate_ref.clone();
+                                        let tx_tree = tx_tree.clone();
+                                        let tx_isolates = tx_isolates.clone();
+                                        let vm_isolates = vm.isolates.clone();
+
+                                        tokio::spawn(async move {
+                                            // Poll for extension
+                                            loop {
+                                                if let Ok(isolate) = client.get_isolate(&isolate_ref.id).await {
+                                                    if let Some(rpcs) = isolate.extension_rpcs {
+                                                        if rpcs.contains(
+                                                            &"ext.flutter.inspector.getRootWidgetSummaryTree"
+                                                                .to_string(),
+                                                        ) {
+                                                            log::info!("Inspector extension found!");
+                                                            break;
+                                                        }
                                                     }
                                                 }
+                                                log::info!("Waiting for inspector extension...");
+                                                tokio::time::sleep(Duration::from_secs(1)).await;
                                             }
-                                            log::info!("Waiting for inspector extension...");
-                                            tokio::time::sleep(Duration::from_secs(1)).await;
-                                        }
 
-                                        match client
-                                            .get_root_widget_summary_tree("tui_inspector", &isolate_ref.id)
-                                            .await
-                                        {
-                                            Ok(tree) => {
-                                                log::info!("Root Widget fetched: {:?}", tree.widget_runtime_type);
-                                                let _ = tx_tree.send(tree).await;
+                                            match client
+                                                .get_root_widget_summary_tree("tui_inspector", &isolate_ref.id)
+                                                .await
+                                            {
+                                                Ok(tree) => {
+                                                    log::info!("Root Widget fetched: {:?}", tree.widget_runtime_type);
+                                                    let _ = tx_tree.send(tree).await;
+                                                }
+                                                Err(e) => {
+                                                    log::error!("Failed to fetch tree: {}", e);
+                                                    let _ = tx_isolates.send(vm_isolates).await;
+                                                }
                                             }
-                                            Err(e) => {
-                                                log::error!("Failed to fetch tree: {}", e);
-                                                let _ = tx_isolates.send(vm.isolates.clone()).await;
-                                            }
-                                        }
+                                        });
                                     }
                                 }
                                 Some(object_id) = rx_details_request.recv() => {
@@ -300,6 +319,19 @@ async fn main() -> Result<()> {
             app_state.add_log(log_entry);
         }
 
+        if let Ok(client) = rx_vm_client.try_recv() {
+            log::info!("Main Loop: Received VM Service Client");
+            app_state.vm_service_client = Some(client);
+        }
+
+        if let Ok((state, stack)) = rx_debug_event.try_recv() {
+            log::info!("Main Loop: Received Debug Event: {:?}", state);
+            app_state.debug_state = state;
+            if let Some(stack) = stack {
+                app_state.stack_trace = Some(stack);
+            }
+        }
+
         // Handle File Watcher Events
         if let Ok(_) = rx_watch.try_recv() {
             // Reset debounce timer
@@ -368,11 +400,10 @@ async fn main() -> Result<()> {
                                 app_state.focus = app_state::Focus::DebuggerFiles;
                             }
                             KeyCode::Char('b') => {
-                                if let Some(line) = app_state.source_selected_line {
+                                if let Some(line_idx) = app_state.source_selected_line {
                                     if let Some(path) = &app_state.open_file_path {
-                                        let bp_id = format!("{}:{}", path, line + 1); // 1-based line for display/VM? VM usually uses 1-based or 0-based?
-                                                                                      // VM addBreakpointWithScriptUri uses 1-based line usually.
-                                                                                      // Let's assume 1-based for now.
+                                        let line = line_idx + 1;
+                                        let bp_id = format!("{}:{}", path, line);
 
                                         let is_existing = app_state.breakpoints.contains(&bp_id);
                                         if is_existing {
@@ -388,8 +419,14 @@ async fn main() -> Result<()> {
                                                     .get(app_state.selected_isolate_index)
                                                 {
                                                     let isolate_id = isolate.id.clone();
-                                                    let script_uri = format!("file://{}", path);
-                                                    let line = line + 1;
+                                                    let full_path =
+                                                        app_state.project_root.join(path);
+                                                    let script_uri = format!(
+                                                        "file://{}",
+                                                        full_path.to_string_lossy()
+                                                    );
+
+                                                    log::info!("Attempting to set breakpoint at {} line {}", script_uri, line);
 
                                                     tokio::spawn(async move {
                                                         match client
@@ -400,11 +437,17 @@ async fn main() -> Result<()> {
                                                             )
                                                             .await
                                                         {
-                                                            Ok(_) => log::info!(
-                                                                "Added breakpoint at {}:{}",
-                                                                script_uri,
-                                                                line
-                                                            ),
+                                                            Ok(response) => {
+                                                                log::info!(
+                                                                    "Added breakpoint at {}:{}",
+                                                                    script_uri,
+                                                                    line
+                                                                );
+                                                                log::info!(
+                                                                    "VM Response: {:?}",
+                                                                    response
+                                                                );
+                                                            }
                                                             Err(e) => log::error!(
                                                                 "Failed to add breakpoint: {}",
                                                                 e
@@ -415,6 +458,8 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                     }
+                                } else {
+                                    log::warn!("Cannot toggle breakpoint: No line selected. Please open a file and select a line.");
                                 }
                             }
                             KeyCode::F(5) => {
@@ -591,8 +636,13 @@ async fn main() -> Result<()> {
                                         .update_debugger_tree_scroll(tree_height.saturating_sub(2));
                                 }
                                 app_state::Focus::DebuggerSource => {
-                                    if app_state.source_scroll_offset > 0 {
-                                        app_state.source_scroll_offset -= 1;
+                                    if let Some(current) = app_state.source_selected_line {
+                                        if current > 0 {
+                                            app_state.source_selected_line = Some(current - 1);
+                                            if current - 1 < app_state.source_scroll_offset {
+                                                app_state.source_scroll_offset = current - 1;
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -635,7 +685,25 @@ async fn main() -> Result<()> {
                                         .update_debugger_tree_scroll(tree_height.saturating_sub(2));
                                 }
                                 app_state::Focus::DebuggerSource => {
-                                    app_state.source_scroll_offset += 1;
+                                    if let Some(current) = app_state.source_selected_line {
+                                        if let Some(content) = &app_state.open_file_content {
+                                            if current < content.len().saturating_sub(1) {
+                                                app_state.source_selected_line = Some(current + 1);
+                                                let inner_height = app_state
+                                                    .debugger_source_area
+                                                    .borrow()
+                                                    .height
+                                                    .saturating_sub(2)
+                                                    as usize;
+                                                if current + 1
+                                                    >= app_state.source_scroll_offset + inner_height
+                                                {
+                                                    app_state.source_scroll_offset =
+                                                        current + 1 - inner_height + 1;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 _ => {}
                             },

@@ -545,6 +545,7 @@ impl AppState {
             self.open_file_content = Some(content.lines().map(|s| s.to_string()).collect());
             self.open_file_path = Some(path.to_string());
             self.source_scroll_offset = 0;
+            self.source_selected_line = Some(0);
         } else {
             log::error!("Failed to open file: {:?}", full_path);
         }
@@ -771,19 +772,16 @@ impl AppState {
 
     pub fn toggle_breakpoint(&mut self) {
         if let Some(path) = &self.open_file_path {
-            // Get current line from scroll offset + selection?
-            // For now, let's say we select lines in source view.
-            // But we don't have line selection yet, just scroll.
-            // Let's assume we toggle on the first visible line + some offset or add cursor support.
-            // For simplicity, let's just use scroll offset for now as "cursor".
-            let line = self.source_scroll_offset + 1;
-            let key = format!("{}:{}", path, line);
-            if self.breakpoints.contains(&key) {
-                self.breakpoints.remove(&key);
-                // TODO: Send remove breakpoint request to VM
-            } else {
-                self.breakpoints.insert(key);
-                // TODO: Send add breakpoint request to VM
+            if let Some(line_idx) = self.source_selected_line {
+                let line = line_idx + 1;
+                let key = format!("{}:{}", path, line);
+                if self.breakpoints.contains(&key) {
+                    self.breakpoints.remove(&key);
+                    // TODO: Send remove breakpoint request to VM
+                } else {
+                    self.breakpoints.insert(key);
+                    // TODO: Send add breakpoint request to VM
+                }
             }
         }
     }
