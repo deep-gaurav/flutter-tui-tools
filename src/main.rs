@@ -46,8 +46,10 @@ async fn main() -> Result<()> {
     let (tx_uri, mut rx_uri) = mpsc::channel(1);
     let (tx_tree, mut rx_tree) = mpsc::channel(1);
     let (tx_log, mut rx_log) = mpsc::unbounded_channel();
-    let (tx_isolates, mut rx_isolates) = mpsc::channel(1);
-    let (tx_selected_isolate, mut rx_selected_isolate) = mpsc::channel(1);
+    let (tx_isolates, mut rx_isolates) = mpsc::channel::<Vec<vm_service::IsolateRef>>(1);
+    let (tx_selected_isolate, mut rx_selected_isolate) = mpsc::channel::<String>(1);
+    let (tx_details_request, mut rx_details_request) = mpsc::channel::<String>(1);
+    let (tx_details, mut rx_details) = mpsc::channel::<vm_service::RemoteDiagnosticsNode>(1);
 
     // Init logger
     logger::init(tx_log)?;
@@ -78,48 +80,65 @@ async fn main() -> Result<()> {
                         let _ = tx_isolates.send(vm.isolates.clone()).await;
 
                         // Wait for selection
-                        while let Some(selected_id) = rx_selected_isolate.recv().await {
-                            if let Some(isolate_ref) =
-                                vm.isolates.iter().find(|i| i.id == selected_id)
-                            {
-                                log::info!("Checking isolate: {}", isolate_ref.name);
-                                // Poll for extension
-                                loop {
-                                    if let Ok(isolate) = client.get_isolate(&isolate_ref.id).await {
-                                        if let Some(rpcs) = isolate.extension_rpcs {
-                                            if rpcs.contains(
-                                                &"ext.flutter.inspector.getRootWidgetSummaryTree"
-                                                    .to_string(),
-                                            ) {
-                                                log::info!("Inspector extension found!");
-                                                break;
+                        let mut current_isolate_id: Option<String> = None;
+
+                        loop {
+                            tokio::select! {
+                                Some(selected_id) = rx_selected_isolate.recv() => {
+                                    if let Some(isolate_ref) = vm.isolates.iter().find(|i| i.id == selected_id) {
+                                        log::info!("Checking isolate: {}", isolate_ref.name);
+                                        current_isolate_id = Some(isolate_ref.id.clone());
+
+                                        // Poll for extension
+                                        loop {
+                                            if let Ok(isolate) = client.get_isolate(&isolate_ref.id).await {
+                                                if let Some(rpcs) = isolate.extension_rpcs {
+                                                    if rpcs.contains(
+                                                        &"ext.flutter.inspector.getRootWidgetSummaryTree"
+                                                            .to_string(),
+                                                    ) {
+                                                        log::info!("Inspector extension found!");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            log::info!("Waiting for inspector extension...");
+                                            tokio::time::sleep(Duration::from_secs(1)).await;
+                                        }
+
+                                        match client
+                                            .get_root_widget_summary_tree("tui_inspector", &isolate_ref.id)
+                                            .await
+                                        {
+                                            Ok(tree) => {
+                                                log::info!("Root Widget fetched: {:?}", tree.widget_runtime_type);
+                                                let _ = tx_tree.send(tree).await;
+                                            }
+                                            Err(e) => {
+                                                log::error!("Failed to fetch tree: {}", e);
+                                                let _ = tx_isolates.send(vm.isolates.clone()).await;
                                             }
                                         }
                                     }
-                                    log::info!("Waiting for inspector extension...");
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
                                 }
-
-                                match client
-                                    .get_root_widget_summary_tree("tui_inspector", &isolate_ref.id)
-                                    .await
-                                {
-                                    Ok(tree) => {
-                                        log::info!(
-                                            "Root Widget fetched: {:?}",
-                                            tree.widget_runtime_type
-                                        );
-                                        let _ = tx_tree.send(tree).await;
-                                        // Success, we can break or stay connected for updates?
-                                        // For now, if we want to allow re-selection on failure, we need to handle failure.
-                                        // But here we succeeded.
+                                Some(object_id) = rx_details_request.recv() => {
+                                    if let Some(isolate_id) = &current_isolate_id {
+                                        log::info!("VM: Fetching details for {} in isolate {}", object_id, isolate_id);
+                                        match client.get_details_subtree(isolate_id, &object_id, 2).await {
+                                            Ok(details) => {
+                                                log::info!("VM: Details fetched successfully");
+                                                let _ = tx_details.send(details).await;
+                                            }
+                                            Err(e) => {
+                                                log::error!("VM: Failed to fetch details: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!("VM: Received details request but current_isolate_id is None");
                                     }
-                                    Err(e) => {
-                                        log::error!("Failed to fetch tree: {}", e);
-                                        // If failed, maybe we should ask user to select again?
-                                        // Send isolates again to trigger popup?
-                                        let _ = tx_isolates.send(vm.isolates.clone()).await;
-                                    }
+                                }
+                                else => {
+                                    break;
                                 }
                             }
                         }
@@ -146,6 +165,10 @@ async fn main() -> Result<()> {
                 // Auto-select if only one
                 let _ = tx_selected_isolate.send(first.id.clone()).await;
             }
+        }
+
+        if let Ok(details) = rx_details.try_recv() {
+            app_state.selected_node_details = Some(details);
         }
 
         while let Ok(log_entry) = rx_log.try_recv() {
@@ -190,6 +213,20 @@ async fn main() -> Result<()> {
                                     app_state.update_tree_scroll(tree_height.saturating_sub(2));
                                     app_state
                                         .ensure_horizontal_visibility(tree_width.saturating_sub(2));
+
+                                    // Request details
+                                    if let Some(node) = app_state.get_selected_node() {
+                                        if let Some(id) = AppState::get_node_id(node) {
+                                            log::info!("UI: Requesting details for id: {}", id);
+                                            let _ = tx_details_request.try_send(id);
+                                        } else {
+                                            log::warn!(
+                                                "UI: Selected node has no object_id or value_id"
+                                            );
+                                        }
+                                    } else {
+                                        log::warn!("UI: No node selected");
+                                    }
                                 }
                                 app_state::Focus::Logs => app_state.scroll_logs(-1),
                                 _ => {}
@@ -206,6 +243,20 @@ async fn main() -> Result<()> {
                                     app_state.update_tree_scroll(tree_height.saturating_sub(2));
                                     app_state
                                         .ensure_horizontal_visibility(tree_width.saturating_sub(2));
+
+                                    // Request details
+                                    if let Some(node) = app_state.get_selected_node() {
+                                        if let Some(id) = AppState::get_node_id(node) {
+                                            log::info!("UI: Requesting details for id: {}", id);
+                                            let _ = tx_details_request.try_send(id);
+                                        } else {
+                                            log::warn!(
+                                                "UI: Selected node has no object_id or value_id"
+                                            );
+                                        }
+                                    } else {
+                                        log::warn!("UI: No node selected");
+                                    }
                                 }
                                 app_state::Focus::Logs => app_state.scroll_logs(1),
                                 _ => {}
@@ -226,6 +277,18 @@ async fn main() -> Result<()> {
                                         app_state.ensure_horizontal_visibility(
                                             tree_width.saturating_sub(2),
                                         );
+
+                                        // Request details
+                                        if let Some(node) = app_state.get_selected_node() {
+                                            if let Some(id) = AppState::get_node_id(node) {
+                                                log::info!("UI: Requesting details for id: {}", id);
+                                                let _ = tx_details_request.try_send(id);
+                                            } else {
+                                                log::warn!("UI: Selected node has no object_id or value_id");
+                                            }
+                                        } else {
+                                            log::warn!("UI: No node selected");
+                                        }
                                     }
                                 }
                             }

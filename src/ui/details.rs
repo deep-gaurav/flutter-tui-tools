@@ -16,16 +16,35 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let content = if let Some(root) = &state.root_node {
-        // Re-flatten to find the selected node by index
-        // TODO: Optimize this by storing the flattened list or using a better data structure
+    let content = if let Some(details) = &state.selected_node_details {
+        let mut text = format!(
+            "Type: {}\nDescription: {}\nObject ID: {}\nValue ID: {}\n\nProperties:\n",
+            details.widget_runtime_type.as_deref().unwrap_or("Unknown"),
+            details.description.as_deref().unwrap_or("-"),
+            details.object_id.as_deref().unwrap_or("-"),
+            details.value_id.as_deref().unwrap_or("-")
+        );
+
+        if let Some(props) = &details.properties {
+            for prop in props {
+                let name = prop.name.as_deref().unwrap_or("");
+                let desc = prop.description.as_deref().unwrap_or("");
+                if !name.is_empty() || !desc.is_empty() {
+                    text.push_str(&format!("- {}: {}\n", name, desc));
+                }
+            }
+        }
+        text
+    } else if let Some(root) = &state.root_node {
+        // Fallback to tree node if details not yet loaded
+        // ... (existing logic)
         let mut lines = Vec::new();
         let mut visible_nodes = Vec::new();
         flatten_tree(root, 0, &mut lines, &mut visible_nodes);
 
         if let Some(node) = visible_nodes.get(state.selected_index) {
             format!(
-                "Type: {}\nDescription: {}\nObject ID: {}\nValue ID: {}",
+                "Type: {}\nDescription: {}\nObject ID: {}\nValue ID: {}\n\n(Fetching details...)",
                 node.widget_runtime_type.as_deref().unwrap_or("Unknown"),
                 node.description.as_deref().unwrap_or("-"),
                 node.object_id.as_deref().unwrap_or("-"),

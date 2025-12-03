@@ -11,6 +11,7 @@ pub enum Focus {
 
 pub struct AppState {
     pub root_node: Option<RemoteDiagnosticsNode>,
+    pub selected_node_details: Option<RemoteDiagnosticsNode>,
     pub connection_status: String,
 
     // Isolate Selection State
@@ -36,6 +37,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             root_node: None,
+            selected_node_details: None,
             connection_status: "Connecting...".to_string(),
             available_isolates: Vec::new(),
             show_isolate_selection: false,
@@ -60,10 +62,11 @@ impl AppState {
         self.root_node = Some(node);
         // Reset selection on new tree
         self.selected_index = 0;
+        self.selected_node_details = None;
         self.tree_scroll_offset = 0;
     }
 
-    fn get_node_id(node: &RemoteDiagnosticsNode) -> Option<String> {
+    pub fn get_node_id(node: &RemoteDiagnosticsNode) -> Option<String> {
         // Prefer value_id, then object_id, then maybe something else?
         // value_id seems to be the persistent ID for the widget in the inspector.
         node.value_id.clone().or(node.object_id.clone())
@@ -126,7 +129,7 @@ impl AppState {
     }
 
     // Helper to find the node at the current selected index based on visible nodes
-    fn get_selected_node(&self) -> Option<&RemoteDiagnosticsNode> {
+    pub fn get_selected_node(&self) -> Option<&RemoteDiagnosticsNode> {
         if let Some(root) = &self.root_node {
             let mut current_index = 0;
             return self.find_node_at_index(root, &mut current_index);
@@ -165,6 +168,7 @@ impl AppState {
             let mut current_index = 0;
             if let Some(parent_index) = self.find_parent_index(root, &mut current_index, None) {
                 self.selected_index = parent_index;
+                self.selected_node_details = None;
                 self.ensure_selection_visible();
             }
         }
@@ -237,6 +241,7 @@ impl AppState {
             self.selected_index = new_index as usize;
         }
         self.ensure_selection_visible();
+        self.selected_node_details = None;
     }
 
     pub fn ensure_selection_visible(&mut self) {

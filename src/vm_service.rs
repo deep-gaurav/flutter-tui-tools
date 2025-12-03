@@ -26,7 +26,7 @@ pub struct RemoteDiagnosticsNode {
     pub object_id: Option<String>,
     #[serde(rename = "valueId")]
     pub value_id: Option<String>,
-    // Add other fields as needed
+    pub properties: Option<Vec<RemoteDiagnosticsNode>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,10 +132,38 @@ impl VmServiceClient {
             )
             .await?;
 
-        log::debug!(
+        log::info!(
             "getRootWidgetSummaryTree response: {}",
             serde_json::to_string_pretty(&result).unwrap()
         );
+
+        let node_json = if result.get("type").and_then(|t| t.as_str()) == Some("_extensionType") {
+            result.get("result").unwrap_or(&result)
+        } else {
+            &result
+        };
+
+        let node: RemoteDiagnosticsNode = serde_json::from_value(node_json.clone())?;
+        Ok(node)
+    }
+
+    pub async fn get_details_subtree(
+        &mut self,
+        isolate_id: &str,
+        object_id: &str,
+        subtree_depth: i32,
+    ) -> Result<RemoteDiagnosticsNode> {
+        let result = self
+            .send_request(
+                "ext.flutter.inspector.getDetailsSubtree",
+                json!({
+                    "isolateId": isolate_id,
+                    "objectGroup": "tui_inspector",
+                    "arg": object_id,
+                    "subtreeDepth": subtree_depth
+                }),
+            )
+            .await?;
 
         let node_json = if result.get("type").and_then(|t| t.as_str()) == Some("_extensionType") {
             result.get("result").unwrap_or(&result)
