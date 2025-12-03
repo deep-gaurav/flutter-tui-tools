@@ -25,7 +25,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
     f.render_widget(app_bar_block, app_bar_area);
 
-    let button_titles = ["Hot Reload (r)", "Hot Restart (R)", "Auto (a)", "Quit (q)"];
+    let button_titles = [
+        "Hot Reload (r)",
+        "Hot Restart (R)",
+        "Auto (a)",
+        "Refresh (F5)",
+        "Quit (q)",
+    ];
     for (i, title) in button_titles.iter().enumerate() {
         let button_style = if i == 2 {
             // Auto Toggle

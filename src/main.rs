@@ -202,19 +202,14 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 Some(_) = rx_refresh.recv() => {
-                                    if let Some(isolate_id) = &current_isolate_id {
-                                        log::info!("VM: Refreshing tree for isolate {}", isolate_id);
-                                        match client
-                                            .get_root_widget_summary_tree("tui_inspector", isolate_id)
-                                            .await
-                                        {
-                                            Ok(tree) => {
-                                                log::info!("Root Widget refreshed");
-                                                let _ = tx_tree.send(tree).await;
-                                            }
-                                            Err(e) => {
-                                                log::error!("Failed to refresh tree: {}", e);
-                                            }
+                                    log::info!("VM: Refreshing isolates and tree...");
+                                    match client.get_vm().await {
+                                        Ok(vm) => {
+                                            log::info!("VM: Refreshed VM, isolates: {}", vm.isolates.len());
+                                            let _ = tx_isolates.send(vm.isolates).await;
+                                        }
+                                        Err(e) => {
+                                            log::error!("Failed to refresh VM: {}", e);
                                         }
                                     }
                                 }
@@ -462,6 +457,9 @@ async fn main() -> Result<()> {
                             }
                             KeyCode::PageUp => app_state.scroll_logs(-10),
                             KeyCode::PageDown => app_state.scroll_logs(10),
+                            KeyCode::F(5) => {
+                                let _ = tx_refresh.try_send(());
+                            }
                             _ => {}
                         }
                     }
@@ -497,6 +495,10 @@ async fn main() -> Result<()> {
                                             app_state.auto_reload = !app_state.auto_reload;
                                         }
                                         3 => {
+                                            // Refresh Isolates
+                                            let _ = tx_refresh.try_send(());
+                                        }
+                                        4 => {
                                             // Quit
                                             if let Some(tx) = &app_state.tx_flutter_command {
                                                 let _ = tx.send("q".to_string()).await;
