@@ -23,29 +23,44 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let app_bar_block = Block::default().borders(Borders::ALL).title("Controls");
     let app_bar_area = chunks[0];
 
-    let buttons = vec![
-        "Hot Reload (r)",
-        "Hot Restart (R)",
-        "DevTools (v)",
-        "Quit (q)",
-    ];
-
-    let button_constraints: Vec<Constraint> =
-        buttons.iter().map(|_| Constraint::Length(20)).collect();
-    let button_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(button_constraints)
-        .split(app_bar_block.inner(app_bar_area));
-
     f.render_widget(app_bar_block, app_bar_area);
 
-    for (i, label) in buttons.iter().enumerate() {
-        if i < button_layout.len() {
-            let btn = Paragraph::new(*label)
-                .style(Style::default().fg(Color::Cyan).bg(Color::Black))
-                .alignment(ratatui::layout::Alignment::Center);
-            f.render_widget(btn, button_layout[i]);
-        }
+    let button_titles = ["Hot Reload (r)", "Hot Restart (R)", "Auto (a)", "Quit (q)"];
+    for (i, title) in button_titles.iter().enumerate() {
+        let button_style = if i == 2 {
+            // Auto Toggle
+            if state.auto_reload {
+                Style::default().fg(Color::Green).bg(Color::Black)
+            } else {
+                Style::default().fg(Color::Red).bg(Color::Black)
+            }
+        } else {
+            Style::default().fg(Color::Cyan).bg(Color::Black)
+        };
+
+        let display_title = if i == 2 {
+            if state.auto_reload {
+                "Auto (a): ON"
+            } else {
+                "Auto (a): OFF"
+            }
+        } else {
+            title
+        };
+
+        let button = Paragraph::new(display_title)
+            .style(button_style)
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(
+            button,
+            Rect {
+                x: app_bar_area.x + (i as u16 * 20),
+                y: app_bar_area.y,
+                width: 20,
+                height: 3,
+            },
+        );
     }
 
     let main_chunks = Layout::default()

@@ -13,8 +13,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use flutter_daemon::FlutterDaemon;
+use ignore::gitignore::Gitignore;
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, time::Duration};
+use std::path::Path;
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 use vm_service::VmServiceClient;
 
@@ -28,6 +34,10 @@ struct Args {
     /// Device ID to attach to
     #[arg(short, long)]
     device_id: Option<String>,
+
+    /// Directory to watch for changes (defaults to app_dir)
+    #[arg(short, long)]
+    watch_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -57,6 +67,56 @@ async fn main() -> Result<()> {
 
     // Init logger
     logger::init(tx_log)?;
+
+    // Setup File Watcher
+    let (tx_watch, mut rx_watch) = mpsc::channel::<()>(1);
+    let watch_dir = args.watch_dir.clone().unwrap_or(args.app_dir.clone());
+
+    // We need a thread to run the watcher because notify is blocking/sync in its callback usually,
+    // or we can use a channel.
+    // Notify's recommended watcher uses a thread internally.
+    // We'll use a standard std channel to bridge to tokio channel if needed,
+    // or just spawn a blocking task.
+    // Actually, we can just use a sync channel and poll it?
+    // Or better, use a separate task to bridge.
+
+    let (std_tx, std_rx) = std::sync::mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(std_tx, Config::default())?;
+
+    let path_to_watch = Path::new(&watch_dir);
+    log::info!(
+        "Watching directory: {:?}",
+        path_to_watch
+            .canonicalize()
+            .unwrap_or(path_to_watch.to_path_buf())
+    );
+    watcher.watch(path_to_watch, RecursiveMode::Recursive)?;
+
+    // Load gitignore
+    let (gitignore, _) = Gitignore::new(path_to_watch.join(".gitignore"));
+
+    // Bridge task
+    tokio::spawn(async move {
+        while let Ok(res) = std_rx.recv() {
+            match res {
+                Ok(event) => {
+                    let is_dart_change = event.paths.iter().any(|p| {
+                        // Check gitignore
+                        if gitignore.matched(p, false).is_ignore() {
+                            return false;
+                        }
+                        p.extension().map_or(false, |ext| ext == "dart")
+                    });
+
+                    if is_dart_change {
+                        log::info!("Dart file changed: {:?}", event.paths);
+                        let _ = tx_watch.send(()).await;
+                    }
+                }
+                Err(e) => log::error!("Watch error: {:?}", e),
+            }
+        }
+    });
 
     // Start Flutter Daemon
     let daemon = FlutterDaemon::new(tx_uri);
@@ -170,6 +230,8 @@ async fn main() -> Result<()> {
     });
 
     // Main Loop
+    let mut debounce_deadline: Option<Instant> = None;
+
     loop {
         // Update state from channels
         if let Ok(tree) = rx_tree.try_recv() {
@@ -198,6 +260,24 @@ async fn main() -> Result<()> {
                 let _ = tx_refresh.try_send(());
             }
             app_state.add_log(log_entry);
+        }
+
+        // Handle File Watcher Events
+        if let Ok(_) = rx_watch.try_recv() {
+            // Reset debounce timer
+            debounce_deadline = Some(Instant::now() + Duration::from_millis(500));
+        }
+
+        // Check Debounce Timer
+        if let Some(deadline) = debounce_deadline {
+            if Instant::now() >= deadline {
+                debounce_deadline = None;
+                if app_state.auto_reload {
+                    if let Some(tx) = &app_state.tx_flutter_command {
+                        let _ = tx.send("r".to_string()).await;
+                    }
+                }
+            }
         }
 
         terminal.draw(|f| ui::draw(f, &app_state))?;
@@ -262,10 +342,8 @@ async fn main() -> Result<()> {
                                     let _ = tx.send("R".to_string()).await;
                                 }
                             }
-                            KeyCode::Char('v') => {
-                                if let Some(tx) = &app_state.tx_flutter_command {
-                                    let _ = tx.send("v".to_string()).await;
-                                }
+                            KeyCode::Char('a') => {
+                                app_state.auto_reload = !app_state.auto_reload;
                             }
                             KeyCode::Char('f') => {
                                 if app_state.focus == app_state::Focus::Tree {
@@ -415,10 +493,8 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         2 => {
-                                            // DevTools
-                                            if let Some(tx) = &app_state.tx_flutter_command {
-                                                let _ = tx.send("v".to_string()).await;
-                                            }
+                                            // Auto Toggle
+                                            app_state.auto_reload = !app_state.auto_reload;
                                         }
                                         3 => {
                                             // Quit

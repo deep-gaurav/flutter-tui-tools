@@ -37,6 +37,7 @@ pub struct AppState {
     pub current_match_index: usize,  // Index into search_results
 
     pub focus: Focus,
+    pub auto_reload: bool,
 
     pub tx_flutter_command: Option<tokio::sync::mpsc::Sender<String>>,
 }
@@ -61,6 +62,7 @@ impl AppState {
             search_results: Vec::new(),
             current_match_index: 0,
             focus: Focus::Tree,
+            auto_reload: true,
             tx_flutter_command: None,
         }
     }
