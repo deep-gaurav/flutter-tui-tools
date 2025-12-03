@@ -1,4 +1,6 @@
 use crate::vm_service::RemoteDiagnosticsNode;
+use ratatui::layout::Rect;
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -8,9 +10,20 @@ pub enum Focus {
     Logs,
     IsolateSelection,
     Search,
+    DebuggerFiles,
+    DebuggerSource,
+    DebuggerSearch,
+    DebuggerStack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Tab {
+    Inspector,
+    Debugger,
 }
 
 pub struct AppState {
+    pub current_tab: Tab,
     pub root_node: Option<RemoteDiagnosticsNode>,
     pub selected_node_details: Option<RemoteDiagnosticsNode>,
     pub connection_status: String,
@@ -30,6 +43,7 @@ pub struct AppState {
     pub logs: Vec<String>,
     pub log_scroll_state: usize, // Index of the first visible log line
     pub log_auto_scroll: bool,
+    pub show_logs: bool,
 
     // Search State
     pub search_query: String,
@@ -40,10 +54,49 @@ pub struct AppState {
     pub auto_reload: bool,
 
     pub tx_flutter_command: Option<tokio::sync::mpsc::Sender<String>>,
+    pub vm_service_client: Option<crate::vm_service::VmServiceClient>,
+
+    // Debugger State
+    pub project_root: std::path::PathBuf,
+    pub file_list: Vec<String>,
+    pub file_tree: Option<FileNode>,
+    pub selected_file_index: usize,
+    pub debugger_selected_index: usize,
+    pub debugger_expanded_ids: HashSet<String>,
+    pub debugger_tree_scroll_offset: usize,
+    pub debugger_tree_horizontal_scroll: usize,
+    pub open_file_path: Option<String>,
+    pub open_file_content: Option<Vec<String>>,
+    pub source_scroll_offset: usize,
+    pub source_selected_line: Option<usize>,
+    pub breakpoints: HashSet<String>, // "path:line"
+    pub debug_state: DebugState,
+    pub stack_trace: Option<serde_json::Value>,
+
+    pub debugger_search_query: String,
+    pub debugger_search_results: Vec<String>, // Paths of matching nodes
+    pub debugger_current_match_index: usize,
+
+    // UI Areas for Mouse Interaction
+    pub inspector_tree_area: RefCell<Rect>,
+    pub debugger_tree_area: RefCell<Rect>,
+    pub debugger_source_area: RefCell<Rect>,
+    pub isolate_list_area: RefCell<Rect>,
+
+    pub inspector_visible_count: RefCell<usize>,
+    pub debugger_visible_count: RefCell<usize>,
+    pub inspector_tree_height: RefCell<usize>,
+    pub debugger_tree_height: RefCell<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DebugState {
+    Running,
+    Paused { isolate_id: String, reason: String },
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(project_root: std::path::PathBuf) -> Self {
         Self {
             root_node: None,
             selected_node_details: None,
@@ -58,12 +111,42 @@ impl AppState {
             logs: Vec::new(),
             log_scroll_state: 0,
             log_auto_scroll: true,
+            show_logs: true,
             search_query: String::new(),
             search_results: Vec::new(),
             current_match_index: 0,
             focus: Focus::Tree,
             auto_reload: true,
             tx_flutter_command: None,
+            vm_service_client: None,
+            current_tab: Tab::Inspector,
+
+            project_root,
+            file_list: Vec::new(),
+            file_tree: None,
+            selected_file_index: 0,
+            debugger_selected_index: 0,
+            debugger_expanded_ids: HashSet::new(),
+            debugger_tree_scroll_offset: 0,
+            debugger_tree_horizontal_scroll: 0,
+            open_file_path: None,
+            open_file_content: None,
+            source_scroll_offset: 0,
+            source_selected_line: None,
+            breakpoints: HashSet::new(),
+            debug_state: DebugState::Running,
+            stack_trace: None,
+            debugger_search_query: String::new(),
+            debugger_search_results: Vec::new(),
+            debugger_current_match_index: 0,
+            inspector_tree_area: RefCell::new(Rect::default()),
+            debugger_tree_area: RefCell::new(Rect::default()),
+            debugger_source_area: RefCell::new(Rect::default()),
+            isolate_list_area: RefCell::new(Rect::default()),
+            inspector_visible_count: RefCell::new(0),
+            debugger_visible_count: RefCell::new(0),
+            inspector_tree_height: RefCell::new(0),
+            debugger_tree_height: RefCell::new(0),
         }
     }
 
@@ -139,16 +222,30 @@ impl AppState {
         }
     }
 
-    pub fn expand_selected(&mut self) {
+    pub fn expand_selected(&mut self) -> bool {
         if let Some(node) = self.get_selected_node() {
-            // We need to clone the node or IDs to avoid borrowing issues while mutating self.expanded_ids
-            // But we can't clone RemoteDiagnosticsNode easily if it's large, but it's just data.
-            // Actually, we just need to collect IDs to expand.
             let mut ids_to_expand = Vec::new();
             Self::collect_smart_expand_ids(node, &mut ids_to_expand, 5);
 
+            let mut expanded_any = false;
             for id in ids_to_expand {
-                self.expanded_ids.insert(id);
+                if self.expanded_ids.insert(id) {
+                    expanded_any = true;
+                }
+            }
+            return expanded_any;
+        }
+        false
+    }
+
+    pub fn select_first_child(&mut self) {
+        if let Some(node) = self.get_selected_node() {
+            if let Some(children) = &node.children {
+                if !children.is_empty() {
+                    self.selected_index += 1;
+                    self.ensure_selection_visible();
+                    self.selected_node_details = None;
+                }
             }
         }
     }
@@ -300,14 +397,17 @@ impl AppState {
     }
 
     pub fn ensure_selection_visible(&mut self) {
-        // We need to know the height of the viewport to do this correctly,
-        // but we don't have it here.
-        // We'll handle the "scroll into view" logic in the UI draw or
-        // pass the height here.
-        // For now, let's just assume a safe default or handle it in the draw loop?
-        // Actually, standard practice is to update scroll_offset here if we can.
-        // But we don't know the viewport height.
-        // Let's add a method `update_scroll_for_viewport` that the UI calls.
+        let height = *self.inspector_tree_height.borrow();
+        if height <= 2 {
+            return;
+        }
+        let visible_height = height - 2;
+
+        if self.selected_index < self.tree_scroll_offset {
+            self.tree_scroll_offset = self.selected_index;
+        } else if self.selected_index >= self.tree_scroll_offset + visible_height {
+            self.tree_scroll_offset = self.selected_index - visible_height + 1;
+        }
     }
 
     pub fn update_tree_scroll(&mut self, height: usize) {
@@ -422,29 +522,281 @@ impl AppState {
     }
 
     pub fn cycle_focus(&mut self) {
-        if self.show_isolate_selection {
-            return; // Lock focus when selecting isolate
-        }
-        self.focus = match self.focus {
-            Focus::Tree => Focus::Details,
-            Focus::Details => Focus::Logs,
-            Focus::Logs => Focus::Tree,
-            Focus::Search => Focus::Tree, // Cycle back to tree from search
-            Focus::IsolateSelection => Focus::IsolateSelection, // Should not happen if locked
+        self.focus = match self.current_tab {
+            Tab::Inspector => match self.focus {
+                Focus::Tree => Focus::Details,
+                Focus::Details => Focus::Logs,
+                Focus::Logs => Focus::Tree,
+                _ => Focus::Tree,
+            },
+            Tab::Debugger => match self.focus {
+                Focus::DebuggerFiles => Focus::DebuggerSource,
+                Focus::DebuggerSource => Focus::DebuggerStack,
+                Focus::DebuggerStack => Focus::Logs,
+                Focus::Logs => Focus::DebuggerFiles,
+                _ => Focus::DebuggerFiles,
+            },
         };
+    }
+
+    pub fn open_file(&mut self, path: &str) {
+        let full_path = self.project_root.join(path);
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            self.open_file_content = Some(content.lines().map(|s| s.to_string()).collect());
+            self.open_file_path = Some(path.to_string());
+            self.source_scroll_offset = 0;
+        } else {
+            log::error!("Failed to open file: {:?}", full_path);
+        }
+    }
+
+    pub fn build_file_tree(&mut self) {
+        let root_path = self.project_root.clone();
+
+        let walker = ignore::WalkBuilder::new(&root_path)
+            .hidden(true)
+            .git_ignore(true)
+            .sort_by_file_path(|a, b| a.cmp(b))
+            .build();
+
+        let mut nodes: Vec<FileNode> = Vec::new();
+        self.file_list.clear();
+
+        for result in walker {
+            if let Ok(entry) = result {
+                let path = entry.path();
+                if path == root_path {
+                    continue;
+                }
+
+                // Populate file_list
+                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    if let Ok(p) = path.strip_prefix(&root_path) {
+                        self.file_list.push(p.to_string_lossy().to_string());
+                    }
+                }
+
+                // We need to insert this path into our tree
+                Self::insert_path_into_tree(
+                    &mut nodes,
+                    path,
+                    &root_path,
+                    entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
+                );
+            }
+        }
+        self.file_list.sort();
+
+        let root_node = FileNode {
+            path: root_path.clone(),
+            name: root_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            children: nodes,
+            is_dir: true,
+        };
+
+        self.file_tree = Some(root_node);
+    }
+
+    fn insert_path_into_tree(
+        nodes: &mut Vec<FileNode>,
+        path: &std::path::Path,
+        root: &std::path::Path,
+        is_dir: bool,
+    ) {
+        if let Ok(relative) = path.strip_prefix(root) {
+            let components: Vec<_> = relative.components().collect();
+            if components.is_empty() {
+                return;
+            }
+
+            let mut current_level = nodes;
+            for (i, component) in components.iter().enumerate() {
+                let name = component.as_os_str().to_string_lossy().to_string();
+                let is_last = i == components.len() - 1;
+
+                // Check if node exists
+                let mut found_idx = None;
+                for (idx, node) in current_level.iter().enumerate() {
+                    if node.name == name {
+                        found_idx = Some(idx);
+                        break;
+                    }
+                }
+
+                if let Some(idx) = found_idx {
+                    current_level = &mut current_level[idx].children;
+                } else {
+                    let node_path =
+                        root.join(relative.iter().take(i + 1).collect::<std::path::PathBuf>());
+                    // If it's an intermediate node, it must be a directory.
+                    // If it's the last node, use the provided is_dir.
+                    let node_is_dir = if is_last { is_dir } else { true };
+
+                    let new_node = FileNode {
+                        path: node_path,
+                        name: name,
+                        children: Vec::new(),
+                        is_dir: node_is_dir,
+                    };
+                    current_level.push(new_node);
+                    let last_idx = current_level.len() - 1;
+                    current_level = &mut current_level[last_idx].children;
+                }
+            }
+        }
+    }
+
+    pub fn move_debugger_selection(&mut self, delta: isize) {
+        if let Some(root) = &self.file_tree {
+            let count = crate::ui::tree::count_visible_nodes(root, &self.debugger_expanded_ids);
+            if count == 0 {
+                return;
+            }
+            let new_index = (self.debugger_selected_index as isize + delta)
+                .max(0)
+                .min(count as isize - 1);
+            self.debugger_selected_index = new_index as usize;
+        }
+    }
+
+    pub fn update_debugger_tree_scroll(&mut self, visible_height: usize) {
+        if self.debugger_selected_index < self.debugger_tree_scroll_offset {
+            self.debugger_tree_scroll_offset = self.debugger_selected_index;
+        } else if self.debugger_selected_index >= self.debugger_tree_scroll_offset + visible_height
+        {
+            self.debugger_tree_scroll_offset = self.debugger_selected_index - visible_height + 1;
+        }
+    }
+
+    pub fn ensure_debugger_horizontal_visibility(&mut self, _visible_width: usize) {
+        // Placeholder for horizontal scrolling if needed
+    }
+
+    pub fn toggle_debugger_expand(&mut self) {
+        // We need to clone root to avoid borrow checker issues if we used &self.file_tree directly with &mut self
+        // But get_node_at_index takes reference.
+        // We can't hold reference to file_tree while mutating self.debugger_expanded_ids.
+        // So we need to find the ID first, then mutate.
+
+        let target_id = if let Some(root) = &self.file_tree {
+            let mut current_index = 0;
+            if let Some(node) = crate::ui::tree::get_node_at_index(
+                root,
+                &self.debugger_expanded_ids,
+                self.debugger_selected_index,
+                &mut current_index,
+            ) {
+                crate::ui::tree::Treeable::id(node).map(|s| s.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(id) = target_id {
+            if self.debugger_expanded_ids.contains(&id) {
+                self.debugger_expanded_ids.remove(&id);
+            } else {
+                self.debugger_expanded_ids.insert(id);
+            }
+        }
+    }
+
+    pub fn open_selected_debugger_file(&mut self) {
+        let target_path = if let Some(root) = &self.file_tree {
+            let mut current_index = 0;
+            if let Some(node) = crate::ui::tree::get_node_at_index(
+                root,
+                &self.debugger_expanded_ids,
+                self.debugger_selected_index,
+                &mut current_index,
+            ) {
+                if !node.is_dir {
+                    Some(node.path.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(path) = target_path {
+            if let Ok(p) = path.strip_prefix(&self.project_root) {
+                self.open_file(&p.to_string_lossy());
+                self.focus = Focus::DebuggerSource;
+            }
+        }
+    }
+
+    pub fn activate_selected_debugger_node(&mut self) {
+        let (is_dir, id) = if let Some(root) = &self.file_tree {
+            let mut current_index = 0;
+            if let Some(node) = crate::ui::tree::get_node_at_index(
+                root,
+                &self.debugger_expanded_ids,
+                self.debugger_selected_index,
+                &mut current_index,
+            ) {
+                (
+                    node.is_dir,
+                    crate::ui::tree::Treeable::id(node).map(|s| s.to_string()),
+                )
+            } else {
+                (false, None)
+            }
+        } else {
+            (false, None)
+        };
+
+        if is_dir {
+            if let Some(id) = id {
+                if self.debugger_expanded_ids.contains(&id) {
+                    self.debugger_expanded_ids.remove(&id);
+                } else {
+                    self.debugger_expanded_ids.insert(id);
+                }
+            }
+        } else {
+            self.open_selected_debugger_file();
+        }
+    }
+
+    pub fn toggle_breakpoint(&mut self) {
+        if let Some(path) = &self.open_file_path {
+            // Get current line from scroll offset + selection?
+            // For now, let's say we select lines in source view.
+            // But we don't have line selection yet, just scroll.
+            // Let's assume we toggle on the first visible line + some offset or add cursor support.
+            // For simplicity, let's just use scroll offset for now as "cursor".
+            let line = self.source_scroll_offset + 1;
+            let key = format!("{}:{}", path, line);
+            if self.breakpoints.contains(&key) {
+                self.breakpoints.remove(&key);
+                // TODO: Send remove breakpoint request to VM
+            } else {
+                self.breakpoints.insert(key);
+                // TODO: Send add breakpoint request to VM
+            }
+        }
     }
 
     pub fn move_isolate_selection(&mut self, delta: isize) {
         if self.available_isolates.is_empty() {
             return;
         }
-        let new_index = self.selected_isolate_index as isize + delta;
-        if new_index < 0 {
-            self.selected_isolate_index = 0;
-        } else if new_index >= self.available_isolates.len() as isize {
-            self.selected_isolate_index = self.available_isolates.len() - 1;
+        let len = self.available_isolates.len();
+        if delta > 0 {
+            self.selected_isolate_index = (self.selected_isolate_index + 1) % len;
         } else {
-            self.selected_isolate_index = new_index as usize;
+            self.selected_isolate_index = (self.selected_isolate_index + len - 1) % len;
         }
     }
 
@@ -494,6 +846,7 @@ impl AppState {
                 match_found = true;
             }
         }
+
         if !match_found {
             if let Some(w_type) = &node.widget_runtime_type {
                 if matcher.fuzzy_match(w_type, query).is_some() {
@@ -545,10 +898,17 @@ impl AppState {
                 self.selected_index = index;
 
                 // 3. Scroll to show context
-                if index >= 3 {
-                    self.tree_scroll_offset = index - 3;
-                } else {
-                    self.tree_scroll_offset = 0;
+                self.ensure_selection_visible();
+                // Center it if possible?
+                // ensure_selection_visible just ensures it's in view.
+                // To center, we'd need to set offset = index - height / 2.
+                let height = *self.inspector_tree_height.borrow();
+                if height > 0 {
+                    if index > height / 2 {
+                        self.tree_scroll_offset = index - height / 2;
+                    } else {
+                        self.tree_scroll_offset = 0;
+                    }
                 }
 
                 let depth = self.get_selected_depth();
@@ -634,5 +994,171 @@ impl AppState {
             }
         }
         None
+    }
+
+    pub fn perform_debugger_search(&mut self) {
+        self.debugger_search_results.clear();
+        self.debugger_current_match_index = 0;
+
+        if self.debugger_search_query.is_empty() {
+            return;
+        }
+
+        if let Some(root) = &self.file_tree {
+            let mut results = Vec::new();
+            Self::search_file_tree_recursive(root, &self.debugger_search_query, &mut results);
+            self.debugger_search_results = results;
+        }
+
+        if !self.debugger_search_results.is_empty() {
+            self.expand_path_to_debugger_selection();
+        }
+    }
+
+    fn search_file_tree_recursive(node: &FileNode, query: &str, results: &mut Vec<String>) {
+        if node.name.to_lowercase().contains(&query.to_lowercase()) {
+            results.push(node.path.to_string_lossy().to_string());
+        }
+
+        for child in &node.children {
+            Self::search_file_tree_recursive(child, query, results);
+        }
+    }
+
+    pub fn next_debugger_match(&mut self) {
+        if self.debugger_search_results.is_empty() {
+            return;
+        }
+        self.debugger_current_match_index =
+            (self.debugger_current_match_index + 1) % self.debugger_search_results.len();
+        self.expand_path_to_debugger_selection();
+    }
+
+    pub fn previous_debugger_match(&mut self) {
+        if self.debugger_search_results.is_empty() {
+            return;
+        }
+        if self.debugger_current_match_index == 0 {
+            self.debugger_current_match_index = self.debugger_search_results.len() - 1;
+        } else {
+            self.debugger_current_match_index -= 1;
+        }
+        self.expand_path_to_debugger_selection();
+    }
+
+    pub fn expand_path_to_debugger_selection(&mut self) {
+        if self.debugger_search_results.is_empty() {
+            return;
+        }
+        let target_path = &self.debugger_search_results[self.debugger_current_match_index];
+
+        // 1. Expand all parents
+        // We need to find the node and collect all parent paths.
+        // Since we have the full path, we can just iterate over ancestors?
+        // But we need to match them to tree nodes to get their IDs (which are paths).
+        // Actually, for FileNode, the ID IS the path.
+        // So we can just take the parent path and add it to expanded_ids.
+
+        let path = std::path::Path::new(target_path);
+        for ancestor in path.ancestors() {
+            if ancestor == path {
+                continue;
+            } // Don't expand self (unless it's a dir we want to look inside? usually we select the file/dir)
+              // We should check if this ancestor exists in our tree (is within project root).
+              // But adding extra IDs to expanded_ids shouldn't hurt.
+            self.debugger_expanded_ids
+                .insert(ancestor.to_string_lossy().to_string());
+        }
+
+        // 2. Calculate visible index
+        if let Some(root) = &self.file_tree {
+            if let Some(index) =
+                Self::find_visible_index_of_path(root, target_path, &self.debugger_expanded_ids)
+            {
+                self.debugger_selected_index = index;
+                // Scroll to make it visible
+                let tree_height = *self.debugger_tree_height.borrow();
+                self.update_debugger_tree_scroll(tree_height.saturating_sub(2));
+            }
+        }
+    }
+
+    fn find_visible_index_of_path(
+        node: &FileNode,
+        target_path: &str,
+        expanded_ids: &HashSet<String>,
+    ) -> Option<usize> {
+        let mut current_index = 0;
+        Self::find_visible_index_of_path_recursive(
+            node,
+            target_path,
+            expanded_ids,
+            &mut current_index,
+        )
+    }
+
+    fn find_visible_index_of_path_recursive(
+        node: &FileNode,
+        target_path: &str,
+        expanded_ids: &HashSet<String>,
+        current_index: &mut usize,
+    ) -> Option<usize> {
+        if node.path.to_string_lossy() == target_path {
+            return Some(*current_index);
+        }
+
+        *current_index += 1;
+
+        if let Some(id) = crate::ui::tree::Treeable::id(node) {
+            if expanded_ids.contains(id) {
+                for child in &node.children {
+                    if let Some(found) = Self::find_visible_index_of_path_recursive(
+                        child,
+                        target_path,
+                        expanded_ids,
+                        current_index,
+                    ) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileNode {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub children: Vec<FileNode>,
+    pub is_dir: bool,
+}
+
+impl crate::ui::tree::Treeable for FileNode {
+    fn children(&self) -> Option<&[Self]> {
+        if self.children.is_empty() {
+            None
+        } else {
+            Some(&self.children)
+        }
+    }
+
+    fn id(&self) -> Option<&str> {
+        self.path.to_str()
+    }
+
+    fn render(&self, depth: usize, is_expanded: bool) -> String {
+        let indent = "  ".repeat(depth);
+        let icon = if self.is_dir {
+            if is_expanded {
+                "▼ 📁 "
+            } else {
+                "▶ 📁 "
+            }
+        } else {
+            "  📄 "
+        };
+        format!("{}{}{}", indent, icon, self.name)
     }
 }

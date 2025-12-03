@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app state
-    let mut app_state = AppState::new();
+    let mut app_state = AppState::new(std::path::PathBuf::from(&args.app_dir));
     let (tx_uri, mut rx_uri) = mpsc::channel(1);
     let (tx_tree, mut rx_tree) = mpsc::channel(1);
     let (tx_log, mut rx_log) = mpsc::unbounded_channel();
@@ -62,6 +62,9 @@ async fn main() -> Result<()> {
     let (tx_details, mut rx_details) = mpsc::channel::<vm_service::RemoteDiagnosticsNode>(1);
     let (tx_cmd, rx_cmd) = mpsc::channel::<String>(10);
     let (tx_refresh, mut rx_refresh) = mpsc::channel::<()>(1);
+    let (tx_vm_client, mut rx_vm_client) = mpsc::channel::<vm_service::VmServiceClient>(1);
+    let (tx_debug_event, mut rx_debug_event) =
+        mpsc::channel::<(app_state::DebugState, Option<serde_json::Value>)>(10);
 
     app_state.tx_flutter_command = Some(tx_cmd);
 
@@ -129,13 +132,29 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Populate file list and tree
+    app_state.build_file_tree();
+
     // VM Service Task
     tokio::spawn(async move {
         if let Some(uri) = rx_uri.recv().await {
             log::info!("Connected to VM Service at: {}", uri);
             // Connect and fetch tree
-            if let Ok(mut client) = VmServiceClient::connect(&uri).await {
+            if let Ok((client, mut rx_event)) = VmServiceClient::connect(&uri).await {
                 log::info!("VM Service Client connected");
+                let _ = tx_vm_client.send(client.clone()).await;
+
+                // Subscribe to streams
+                if let Err(e) = client.stream_listen("Debug").await {
+                    log::error!("Failed to subscribe to Debug stream: {}", e);
+                }
+                if let Err(e) = client.stream_listen("Isolate").await {
+                    log::error!("Failed to subscribe to Isolate stream: {}", e);
+                }
+                if let Err(e) = client.stream_listen("Extension").await {
+                    log::error!("Failed to subscribe to Extension stream: {}", e);
+                }
+
                 if let Ok(vm) = client.get_vm().await {
                     log::info!("VM: {:?}", vm);
 
@@ -148,6 +167,30 @@ async fn main() -> Result<()> {
 
                         loop {
                             tokio::select! {
+                                Some(event) = rx_event.recv() => {
+                                    // Handle VM Events
+                                    match event.event_kind.as_str() {
+                                        "PauseStart" | "PauseBreakpoint" | "PauseException" | "PauseInterrupted" | "PauseExit" => {
+                                            log::info!("VM Event: {} in {:?}", event.event_kind, event.isolate_id);
+                                            // Fetch stack
+                                            if let Some(isolate_id) = &event.isolate_id {
+                                                if let Ok(stack) = client.get_stack(isolate_id).await {
+                                                    let _ = tx_debug_event.send((app_state::DebugState::Paused {
+                                                        isolate_id: isolate_id.clone(),
+                                                        reason: event.event_kind.clone(),
+                                                    }, Some(stack))).await;
+                                                }
+                                            }
+                                        }
+                                        "Resume" => {
+                                            log::info!("VM Event: Resumed");
+                                            let _ = tx_debug_event.send((app_state::DebugState::Running, None)).await;
+                                        }
+                                        _ => {
+                                            // log::debug!("VM Event: {}", event.event_kind);
+                                        }
+                                    }
+                                }
                                 Some(selected_id) = rx_selected_isolate.recv() => {
                                     if let Some(isolate_ref) = vm.isolates.iter().find(|i| i.id == selected_id) {
                                         log::info!("Checking isolate: {}", isolate_ref.name);
@@ -319,8 +362,119 @@ async fn main() -> Result<()> {
                             }
                             _ => {}
                         }
+                    } else if app_state.focus == app_state::Focus::DebuggerSource {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app_state.focus = app_state::Focus::DebuggerFiles;
+                            }
+                            KeyCode::Char('b') => {
+                                if let Some(line) = app_state.source_selected_line {
+                                    if let Some(path) = &app_state.open_file_path {
+                                        let bp_id = format!("{}:{}", path, line + 1); // 1-based line for display/VM? VM usually uses 1-based or 0-based?
+                                                                                      // VM addBreakpointWithScriptUri uses 1-based line usually.
+                                                                                      // Let's assume 1-based for now.
+
+                                        let is_existing = app_state.breakpoints.contains(&bp_id);
+                                        if is_existing {
+                                            app_state.breakpoints.remove(&bp_id);
+                                            // TODO: Send removeBreakpoint to VM
+                                        } else {
+                                            app_state.breakpoints.insert(bp_id.clone());
+                                            // Send addBreakpoint to VM
+                                            if let Some(client) = &app_state.vm_service_client {
+                                                let client = client.clone();
+                                                if let Some(isolate) = app_state
+                                                    .available_isolates
+                                                    .get(app_state.selected_isolate_index)
+                                                {
+                                                    let isolate_id = isolate.id.clone();
+                                                    let script_uri = format!("file://{}", path);
+                                                    let line = line + 1;
+
+                                                    tokio::spawn(async move {
+                                                        match client
+                                                            .add_breakpoint_with_script_uri(
+                                                                &isolate_id,
+                                                                &script_uri,
+                                                                line,
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(_) => log::info!(
+                                                                "Added breakpoint at {}:{}",
+                                                                script_uri,
+                                                                line
+                                                            ),
+                                                            Err(e) => log::error!(
+                                                                "Failed to add breakpoint: {}",
+                                                                e
+                                                            ),
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::F(5) => {
+                                // Resume
+                                if let Some(client) = &app_state.vm_service_client {
+                                    let client = client.clone();
+                                    if let Some(isolate) = app_state
+                                        .available_isolates
+                                        .get(app_state.selected_isolate_index)
+                                    {
+                                        let isolate_id = isolate.id.clone();
+                                        tokio::spawn(async move {
+                                            let _ = client.resume(&isolate_id, None).await;
+                                        });
+                                    }
+                                }
+                            }
+                            KeyCode::F(10) => {
+                                // Step Over
+                                if let Some(client) = &app_state.vm_service_client {
+                                    let client = client.clone();
+                                    if let Some(isolate) = app_state
+                                        .available_isolates
+                                        .get(app_state.selected_isolate_index)
+                                    {
+                                        let isolate_id = isolate.id.clone();
+                                        tokio::spawn(async move {
+                                            let _ = client.resume(&isolate_id, Some("Over")).await;
+                                        });
+                                    }
+                                }
+                            }
+                            KeyCode::F(11) => {
+                                // Step Into
+                                if let Some(client) = &app_state.vm_service_client {
+                                    let client = client.clone();
+                                    if let Some(isolate) = app_state
+                                        .available_isolates
+                                        .get(app_state.selected_isolate_index)
+                                    {
+                                        let isolate_id = isolate.id.clone();
+                                        tokio::spawn(async move {
+                                            let _ = client.resume(&isolate_id, Some("Into")).await;
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     } else {
                         match key.code {
+                            KeyCode::Char('1') => {
+                                app_state.current_tab = app_state::Tab::Inspector;
+                            }
+                            KeyCode::Char('2') => {
+                                app_state.current_tab = app_state::Tab::Debugger;
+                            }
+                            KeyCode::Char('l') => {
+                                app_state.show_logs = !app_state.show_logs;
+                            }
                             KeyCode::Char('q') => {
                                 if let Some(tx) = &app_state.tx_flutter_command {
                                     let _ = tx.send("q".to_string()).await;
@@ -346,72 +500,149 @@ async fn main() -> Result<()> {
                                 }
                             }
                             KeyCode::Char('/') => {
-                                app_state.focus = app_state::Focus::Search;
-                                app_state.search_query.clear();
+                                if app_state.focus == app_state::Focus::DebuggerFiles {
+                                    app_state.focus = app_state::Focus::DebuggerSearch;
+                                    app_state.debugger_search_query.clear();
+                                } else {
+                                    app_state.focus = app_state::Focus::Search;
+                                    app_state.search_query.clear();
+                                }
                             }
                             KeyCode::Tab => app_state.cycle_focus(),
+                            KeyCode::Esc => {
+                                if app_state.focus == app_state::Focus::DebuggerSearch {
+                                    app_state.focus = app_state::Focus::DebuggerFiles;
+                                } else if app_state.focus == app_state::Focus::Search {
+                                    app_state.focus = app_state::Focus::Tree;
+                                } else if app_state.focus == app_state::Focus::DebuggerSource {
+                                    app_state.focus = app_state::Focus::DebuggerFiles;
+                                }
+                            }
+                            KeyCode::Char(c)
+                                if app_state.focus == app_state::Focus::DebuggerSearch =>
+                            {
+                                app_state.debugger_search_query.push(c);
+                                app_state.perform_debugger_search();
+                            }
+                            KeyCode::Backspace
+                                if app_state.focus == app_state::Focus::DebuggerSearch =>
+                            {
+                                app_state.debugger_search_query.pop();
+                                app_state.perform_debugger_search();
+                            }
+                            KeyCode::Enter
+                                if app_state.focus == app_state::Focus::DebuggerSearch =>
+                            {
+                                app_state.next_debugger_match();
+                            }
+                            KeyCode::Char('n')
+                                if app_state.focus == app_state::Focus::DebuggerFiles =>
+                            {
+                                app_state.next_debugger_match();
+                            }
+                            KeyCode::Char('N')
+                                if app_state.focus == app_state::Focus::DebuggerFiles =>
+                            {
+                                app_state.previous_debugger_match();
+                            }
                             KeyCode::Up => match app_state.focus {
                                 app_state::Focus::Tree => {
-                                    app_state.move_selection(-1);
+                                    if app_state.current_tab == app_state::Tab::Inspector {
+                                        app_state.move_selection(-1);
+                                        let (cols, rows) = terminal
+                                            .size()
+                                            .map(|r| (r.width, r.height))
+                                            .unwrap_or((0, 0));
+                                        let tree_height = (rows.saturating_sub(3 + 10)) as usize; // Approx tree height (minus app bar and logs)
+                                        let tree_width = (cols as f32 * 0.75) as usize;
+                                        app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                        app_state.ensure_horizontal_visibility(
+                                            tree_width.saturating_sub(2),
+                                        );
+
+                                        // Request details
+                                        if let Some(node) = app_state.get_selected_node() {
+                                            if let Some(id) = AppState::get_node_id(node) {
+                                                log::info!("UI: Requesting details for id: {}", id);
+                                                let _ = tx_details_request.try_send(id);
+                                            } else {
+                                                log::warn!(
+                                                    "UI: Selected node has no object_id or value_id"
+                                                );
+                                            }
+                                        } else {
+                                            log::warn!("UI: No node selected");
+                                        }
+                                    }
+                                }
+                                app_state::Focus::Logs => app_state.scroll_logs(-1),
+                                app_state::Focus::DebuggerFiles => {
+                                    app_state.move_debugger_selection(-1);
                                     let (cols, rows) = terminal
                                         .size()
                                         .map(|r| (r.width, r.height))
                                         .unwrap_or((0, 0));
-                                    let tree_height = (rows.saturating_sub(3 + 10)) as usize; // Approx tree height (minus app bar and logs)
-                                    let tree_width = (cols as f32 * 0.75) as usize;
-                                    app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                    // Calculate debugger tree height.
+                                    // Layout is: 20% width. Height is full area minus borders?
+                                    // In debugger.rs: chunks[0] is File Explorer.
+                                    // We stored height in app_state.debugger_tree_height
+                                    let tree_height = *app_state.debugger_tree_height.borrow();
                                     app_state
-                                        .ensure_horizontal_visibility(tree_width.saturating_sub(2));
-
-                                    // Request details
-                                    if let Some(node) = app_state.get_selected_node() {
-                                        if let Some(id) = AppState::get_node_id(node) {
-                                            log::info!("UI: Requesting details for id: {}", id);
-                                            let _ = tx_details_request.try_send(id);
-                                        } else {
-                                            log::warn!(
-                                                "UI: Selected node has no object_id or value_id"
-                                            );
-                                        }
-                                    } else {
-                                        log::warn!("UI: No node selected");
+                                        .update_debugger_tree_scroll(tree_height.saturating_sub(2));
+                                }
+                                app_state::Focus::DebuggerSource => {
+                                    if app_state.source_scroll_offset > 0 {
+                                        app_state.source_scroll_offset -= 1;
                                     }
                                 }
-                                app_state::Focus::Logs => app_state.scroll_logs(-1),
                                 _ => {}
                             },
                             KeyCode::Down => match app_state.focus {
                                 app_state::Focus::Tree => {
-                                    app_state.move_selection(1);
-                                    let (cols, rows) = terminal
-                                        .size()
-                                        .map(|r| (r.width, r.height))
-                                        .unwrap_or((0, 0));
-                                    let tree_height = (rows.saturating_sub(3 + 10)) as usize; // Approx tree height
-                                    let tree_width = (cols as f32 * 0.75) as usize;
-                                    app_state.update_tree_scroll(tree_height.saturating_sub(2));
-                                    app_state
-                                        .ensure_horizontal_visibility(tree_width.saturating_sub(2));
+                                    if app_state.current_tab == app_state::Tab::Inspector {
+                                        app_state.move_selection(1);
+                                        let (cols, rows) = terminal
+                                            .size()
+                                            .map(|r| (r.width, r.height))
+                                            .unwrap_or((0, 0));
+                                        let tree_height = (rows.saturating_sub(3 + 10)) as usize; // Approx tree height
+                                        let tree_width = (cols as f32 * 0.75) as usize;
+                                        app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                        app_state.ensure_horizontal_visibility(
+                                            tree_width.saturating_sub(2),
+                                        );
 
-                                    // Request details
-                                    if let Some(node) = app_state.get_selected_node() {
-                                        if let Some(id) = AppState::get_node_id(node) {
-                                            log::info!("UI: Requesting details for id: {}", id);
-                                            let _ = tx_details_request.try_send(id);
+                                        // Request details
+                                        if let Some(node) = app_state.get_selected_node() {
+                                            if let Some(id) = AppState::get_node_id(node) {
+                                                log::info!("UI: Requesting details for id: {}", id);
+                                                let _ = tx_details_request.try_send(id);
+                                            } else {
+                                                log::warn!(
+                                                    "UI: Selected node has no object_id or value_id"
+                                                );
+                                            }
                                         } else {
-                                            log::warn!(
-                                                "UI: Selected node has no object_id or value_id"
-                                            );
+                                            log::warn!("UI: No node selected");
                                         }
-                                    } else {
-                                        log::warn!("UI: No node selected");
                                     }
                                 }
                                 app_state::Focus::Logs => app_state.scroll_logs(1),
+                                app_state::Focus::DebuggerFiles => {
+                                    app_state.move_debugger_selection(1);
+                                    let tree_height = *app_state.debugger_tree_height.borrow();
+                                    app_state
+                                        .update_debugger_tree_scroll(tree_height.saturating_sub(2));
+                                }
+                                app_state::Focus::DebuggerSource => {
+                                    app_state.source_scroll_offset += 1;
+                                }
                                 _ => {}
                             },
                             KeyCode::Left => {
-                                if app_state.focus == app_state::Focus::Tree {
+                                if app_state.focus == app_state::Focus::Tree
+                                    && app_state.current_tab == app_state::Tab::Inspector
+                                {
                                     if key.modifiers.contains(event::KeyModifiers::SHIFT) {
                                         app_state.scroll_tree_horizontal(-1);
                                     } else if !app_state.collapse_selected() {
@@ -432,31 +663,85 @@ async fn main() -> Result<()> {
                                             if let Some(id) = AppState::get_node_id(node) {
                                                 log::info!("UI: Requesting details for id: {}", id);
                                                 let _ = tx_details_request.try_send(id);
-                                            } else {
-                                                log::warn!("UI: Selected node has no object_id or value_id");
                                             }
-                                        } else {
-                                            log::warn!("UI: No node selected");
                                         }
                                     }
+                                } else if app_state.focus == app_state::Focus::DebuggerFiles {
+                                    app_state.toggle_debugger_expand();
                                 }
                             }
                             KeyCode::Right => {
-                                if app_state.focus == app_state::Focus::Tree {
+                                if app_state.focus == app_state::Focus::Tree
+                                    && app_state.current_tab == app_state::Tab::Inspector
+                                {
                                     if key.modifiers.contains(event::KeyModifiers::SHIFT) {
                                         app_state.scroll_tree_horizontal(1);
+                                    } else if !app_state.expand_selected() {
+                                        app_state.select_first_child();
+                                        let (cols, rows) = terminal
+                                            .size()
+                                            .map(|r| (r.width, r.height))
+                                            .unwrap_or((0, 0));
+                                        let tree_height = (rows.saturating_sub(3 + 10)) as usize;
+                                        let tree_width = (cols as f32 * 0.75) as usize;
+                                        app_state.update_tree_scroll(tree_height.saturating_sub(2));
+                                        app_state.ensure_horizontal_visibility(
+                                            tree_width.saturating_sub(2),
+                                        );
+
+                                        // Request details
+                                        if let Some(node) = app_state.get_selected_node() {
+                                            if let Some(id) = AppState::get_node_id(node) {
+                                                log::info!("UI: Requesting details for id: {}", id);
+                                                let _ = tx_details_request.try_send(id);
+                                            }
+                                        }
+                                    }
+                                } else if app_state.focus == app_state::Focus::DebuggerFiles {
+                                    app_state.toggle_debugger_expand();
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => match app_state.focus {
+                                app_state::Focus::IsolateSelection => {
+                                    if let Some(isolate) = app_state
+                                        .available_isolates
+                                        .get(app_state.selected_isolate_index)
+                                    {
+                                        let id = &isolate.id;
+                                        log::info!("Selecting isolate: {}", id);
+                                        let _ = tx_selected_isolate.try_send(id.clone());
+                                        app_state.show_isolate_selection = false;
+                                        app_state.focus = app_state::Focus::Tree;
+                                    }
+                                }
+                                app_state::Focus::DebuggerFiles => {
+                                    app_state.activate_selected_debugger_node();
+                                }
+                                _ => {}
+                            },
+                            KeyCode::Char('b') => {
+                                if app_state.focus == app_state::Focus::DebuggerSource {
+                                    app_state.toggle_breakpoint();
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if app_state.focus == app_state::Focus::Logs {
+                                    app_state.scroll_logs(-10);
+                                } else if app_state.focus == app_state::Focus::DebuggerSource {
+                                    if app_state.source_scroll_offset > 10 {
+                                        app_state.source_scroll_offset -= 10;
                                     } else {
-                                        app_state.expand_selected();
+                                        app_state.source_scroll_offset = 0;
                                     }
                                 }
                             }
-                            KeyCode::Enter | KeyCode::Char(' ') => {
-                                if app_state.focus == app_state::Focus::Tree {
-                                    app_state.toggle_expand();
+                            KeyCode::PageDown => {
+                                if app_state.focus == app_state::Focus::Logs {
+                                    app_state.scroll_logs(10);
+                                } else if app_state.focus == app_state::Focus::DebuggerSource {
+                                    app_state.source_scroll_offset += 10;
                                 }
                             }
-                            KeyCode::PageUp => app_state.scroll_logs(-10),
-                            KeyCode::PageDown => app_state.scroll_logs(10),
                             KeyCode::F(5) => {
                                 let _ = tx_refresh.try_send(());
                             }
@@ -468,37 +753,42 @@ async fn main() -> Result<()> {
                     if !app_state.show_isolate_selection {
                         match mouse.kind {
                             event::MouseEventKind::Down(event::MouseButton::Left) => {
-                                let (cols, rows) = terminal
-                                    .size()
-                                    .map(|r| (r.width, r.height))
-                                    .unwrap_or((0, 0));
-
                                 // App Bar Click Handling
                                 if mouse.row < 3 {
                                     // Button width is 20
                                     let button_index = (mouse.column as usize) / 20;
                                     match button_index {
-                                        0 => {
+                                        0 => app_state.current_tab = app_state::Tab::Inspector,
+                                        1 => app_state.current_tab = app_state::Tab::Debugger,
+                                        2 => {
                                             // Hot Reload
                                             if let Some(tx) = &app_state.tx_flutter_command {
                                                 let _ = tx.send("r".to_string()).await;
                                             }
                                         }
-                                        1 => {
+                                        3 => {
                                             // Hot Restart
                                             if let Some(tx) = &app_state.tx_flutter_command {
                                                 let _ = tx.send("R".to_string()).await;
                                             }
                                         }
-                                        2 => {
-                                            // Auto Toggle
+                                        4 => {
+                                            // Auto Hot Reload Toggle
                                             app_state.auto_reload = !app_state.auto_reload;
+                                            log::info!(
+                                                "Auto Hot Reload: {}",
+                                                if app_state.auto_reload { "ON" } else { "OFF" }
+                                            );
                                         }
-                                        3 => {
+                                        5 => {
                                             // Refresh Isolates
                                             let _ = tx_refresh.try_send(());
                                         }
-                                        4 => {
+                                        6 => {
+                                            // Logs Toggle
+                                            app_state.show_logs = !app_state.show_logs;
+                                        }
+                                        7 => {
                                             // Quit
                                             if let Some(tx) = &app_state.tx_flutter_command {
                                                 let _ = tx.send("q".to_string()).await;
@@ -507,77 +797,177 @@ async fn main() -> Result<()> {
                                         }
                                         _ => {}
                                     }
-                                    continue;
-                                }
+                                } else {
+                                    // Tree Interaction
+                                    let x = mouse.column;
+                                    let y = mouse.row;
 
-                                // Layout:
-                                // App Bar: 3 lines
-                                // Main Content: Remaining - 10
-                                // Logs: 10 lines
-                                let app_bar_height = 3;
-                                let log_height = 10;
-                                let main_height = rows.saturating_sub(app_bar_height + log_height);
-                                let split_y = app_bar_height + main_height;
-                                let split_x = (cols as f32 * 0.75) as u16;
+                                    // Inspector Tree
+                                    if app_state.current_tab == app_state::Tab::Inspector {
+                                        let inspector_area =
+                                            *app_state.inspector_tree_area.borrow();
+                                        if x >= inspector_area.x
+                                            && x < inspector_area.x + inspector_area.width
+                                            && y >= inspector_area.y
+                                            && y < inspector_area.y + inspector_area.height
+                                        {
+                                            app_state.focus = app_state::Focus::Tree;
+                                            let relative_y = (y - inspector_area.y) as usize;
+                                            let index = relative_y + app_state.tree_scroll_offset;
 
-                                if mouse.row >= app_bar_height && mouse.row < split_y {
-                                    if mouse.column < split_x {
-                                        app_state.focus = app_state::Focus::Tree;
-                                        // Handle tree click
-                                        let tree_y = mouse.row.saturating_sub(app_bar_height + 1); // -1 for top border
-                                        if tree_y < main_height.saturating_sub(2) {
-                                            // Check if within content area
-                                            let clicked_index =
-                                                tree_y as usize + app_state.tree_scroll_offset;
-                                            if clicked_index < app_state.visible_count() {
-                                                app_state.selected_index = clicked_index;
+                                            let count = *app_state.inspector_visible_count.borrow();
+                                            if index < count {
+                                                if index == app_state.selected_index {
+                                                    app_state.toggle_expand();
+                                                } else {
+                                                    app_state.selected_index = index;
+                                                    // Request details
+                                                    if let Some(node) =
+                                                        app_state.get_selected_node()
+                                                    {
+                                                        if let Some(id) =
+                                                            AppState::get_node_id(node)
+                                                        {
+                                                            log::info!(
+                                                                "UI: Requesting details for id: {}",
+                                                                id
+                                                            );
+                                                            let _ = tx_details_request.try_send(id);
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
-                                    } else {
-                                        app_state.focus = app_state::Focus::Details;
                                     }
-                                } else if mouse.row >= split_y {
-                                    app_state.focus = app_state::Focus::Logs;
+
+                                    // Debugger Tree
+                                    if app_state.current_tab == app_state::Tab::Debugger {
+                                        let debugger_area = *app_state.debugger_tree_area.borrow();
+                                        if x >= debugger_area.x
+                                            && x < debugger_area.x + debugger_area.width
+                                            && y >= debugger_area.y
+                                            && y < debugger_area.y + debugger_area.height
+                                        {
+                                            app_state.focus = app_state::Focus::DebuggerFiles;
+                                            let relative_y = (y - debugger_area.y) as usize;
+                                            let index =
+                                                relative_y + app_state.debugger_tree_scroll_offset;
+
+                                            let count = *app_state.debugger_visible_count.borrow();
+                                            if index < count {
+                                                if index == app_state.debugger_selected_index {
+                                                    app_state.activate_selected_debugger_node();
+                                                } else {
+                                                    app_state.debugger_selected_index = index;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if app_state.current_tab == app_state::Tab::Debugger {
+                                        let source_area = *app_state.debugger_source_area.borrow();
+                                        if x >= source_area.x
+                                            && x < source_area.x + source_area.width
+                                            && y >= source_area.y
+                                            && y < source_area.y + source_area.height
+                                        {
+                                            app_state.focus = app_state::Focus::DebuggerSource;
+                                            // Calculate clicked line
+                                            let relative_y =
+                                                y.saturating_sub(source_area.y) as usize;
+                                            let line_index =
+                                                app_state.source_scroll_offset + relative_y;
+                                            app_state.source_selected_line = Some(line_index);
+                                        }
+                                    }
                                 }
                             }
                             event::MouseEventKind::ScrollDown => {
-                                let (cols, rows) = terminal
-                                    .size()
-                                    .map(|r| (r.width, r.height))
-                                    .unwrap_or((0, 0));
-                                let app_bar_height = 3;
-                                let log_height = 10;
-                                let main_height = rows.saturating_sub(app_bar_height + log_height);
-                                let split_y = app_bar_height + main_height;
-                                let split_x = (cols as f32 * 0.75) as u16;
+                                let x = mouse.column;
+                                let y = mouse.row;
 
-                                if mouse.row >= split_y {
-                                    app_state.scroll_logs(1);
-                                } else if mouse.row >= app_bar_height
-                                    && mouse.row < split_y
-                                    && mouse.column < split_x
+                                // Inspector
+                                let inspector_area = *app_state.inspector_tree_area.borrow();
+                                if x >= inspector_area.x
+                                    && x < inspector_area.x + inspector_area.width
+                                    && y >= inspector_area.y
+                                    && y < inspector_area.y + inspector_area.height
                                 {
                                     app_state.scroll_tree(1);
                                 }
-                            }
-                            event::MouseEventKind::ScrollUp => {
-                                let (cols, rows) = terminal
+
+                                // Debugger
+                                let debugger_area = *app_state.debugger_tree_area.borrow();
+                                if x >= debugger_area.x
+                                    && x < debugger_area.x + debugger_area.width
+                                    && y >= debugger_area.y
+                                    && y < debugger_area.y + debugger_area.height
+                                {
+                                    app_state.move_debugger_selection(1);
+                                }
+
+                                // Logs
+                                let (_, rows) = terminal
                                     .size()
                                     .map(|r| (r.width, r.height))
                                     .unwrap_or((0, 0));
-                                let app_bar_height = 3;
-                                let log_height = 10;
-                                let main_height = rows.saturating_sub(app_bar_height + log_height);
-                                let split_y = app_bar_height + main_height;
-                                let split_x = (cols as f32 * 0.75) as u16;
+                                if app_state.show_logs && y >= rows.saturating_sub(10) {
+                                    app_state.scroll_logs(1);
+                                }
 
-                                if mouse.row >= split_y {
-                                    app_state.scroll_logs(-1);
-                                } else if mouse.row >= app_bar_height
-                                    && mouse.row < split_y
-                                    && mouse.column < split_x
+                                // Debugger Source
+                                let source_area = *app_state.debugger_source_area.borrow();
+                                if x >= source_area.x
+                                    && x < source_area.x + source_area.width
+                                    && y >= source_area.y
+                                    && y < source_area.y + source_area.height
+                                {
+                                    app_state.source_scroll_offset += 1;
+                                }
+                            }
+                            event::MouseEventKind::ScrollUp => {
+                                let x = mouse.column;
+                                let y = mouse.row;
+
+                                // Inspector
+                                let inspector_area = *app_state.inspector_tree_area.borrow();
+                                if x >= inspector_area.x
+                                    && x < inspector_area.x + inspector_area.width
+                                    && y >= inspector_area.y
+                                    && y < inspector_area.y + inspector_area.height
                                 {
                                     app_state.scroll_tree(-1);
+                                }
+
+                                // Debugger
+                                let debugger_area = *app_state.debugger_tree_area.borrow();
+                                if x >= debugger_area.x
+                                    && x < debugger_area.x + debugger_area.width
+                                    && y >= debugger_area.y
+                                    && y < debugger_area.y + debugger_area.height
+                                {
+                                    app_state.move_debugger_selection(-1);
+                                }
+
+                                // Logs
+                                let (_, rows) = terminal
+                                    .size()
+                                    .map(|r| (r.width, r.height))
+                                    .unwrap_or((0, 0));
+                                if app_state.show_logs && y >= rows.saturating_sub(10) {
+                                    app_state.scroll_logs(-1);
+                                }
+
+                                // Debugger Source
+                                let source_area = *app_state.debugger_source_area.borrow();
+                                if x >= source_area.x
+                                    && x < source_area.x + source_area.width
+                                    && y >= source_area.y
+                                    && y < source_area.y + source_area.height
+                                {
+                                    if app_state.source_scroll_offset > 0 {
+                                        app_state.source_scroll_offset -= 1;
+                                    }
                                 }
                             }
                             _ => {}
