@@ -22,7 +22,8 @@ impl FlutterDaemon {
             .arg("--verbose")
             .current_dir(app_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
 
         if let Some(id) = device_id {
             cmd.arg("-d").arg(id);

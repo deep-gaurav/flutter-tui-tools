@@ -3,7 +3,9 @@ pub mod tree;
 
 use crate::app_state::AppState;
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -66,6 +68,29 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.show_isolate_selection {
         draw_isolate_selection_popup(f, state);
     }
+
+    // Draw Search Input if active
+    if state.focus == crate::app_state::Focus::Search {
+        let area = centered_rect(60, 20, f.area());
+        let block = Block::default()
+            .title("Search")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let text = format!(
+            "Query: {}\nMatches: {}/{}\n\n(Enter: Next, Shift+Enter: Prev, Esc: Cancel)",
+            state.search_query,
+            if state.search_results.is_empty() {
+                0
+            } else {
+                state.current_match_index + 1
+            },
+            state.search_results.len()
+        );
+        let paragraph = Paragraph::new(text).block(block);
+        f.render_widget(Clear, area); // Clear background
+        f.render_widget(paragraph, area);
+    }
 }
 
 fn draw_isolate_selection_popup(f: &mut Frame, state: &AppState) {
@@ -103,11 +128,7 @@ fn draw_isolate_selection_popup(f: &mut Frame, state: &AppState) {
     f.render_stateful_widget(list, inner_area, &mut list_state);
 }
 
-fn centered_rect(
-    percent_x: u16,
-    percent_y: u16,
-    r: ratatui::layout::Rect,
-) -> ratatui::layout::Rect {
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

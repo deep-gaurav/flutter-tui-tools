@@ -7,6 +7,7 @@ pub enum Focus {
     Details,
     Logs,
     IsolateSelection,
+    Search,
 }
 
 pub struct AppState {
@@ -30,6 +31,11 @@ pub struct AppState {
     pub log_scroll_state: usize, // Index of the first visible log line
     pub log_auto_scroll: bool,
 
+    // Search State
+    pub search_query: String,
+    pub search_results: Vec<String>, // IDs of matching nodes
+    pub current_match_index: usize,  // Index into search_results
+
     pub focus: Focus,
 }
 
@@ -49,6 +55,9 @@ impl AppState {
             logs: Vec::new(),
             log_scroll_state: 0,
             log_auto_scroll: true,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            current_match_index: 0,
             focus: Focus::Tree,
         }
     }
@@ -374,6 +383,7 @@ impl AppState {
             Focus::Tree => Focus::Details,
             Focus::Details => Focus::Logs,
             Focus::Logs => Focus::Tree,
+            Focus::Search => Focus::Tree, // Cycle back to tree from search
             Focus::IsolateSelection => Focus::IsolateSelection, // Should not happen if locked
         };
     }
@@ -390,5 +400,193 @@ impl AppState {
         } else {
             self.selected_isolate_index = new_index as usize;
         }
+    }
+
+    pub fn focus_selected_node(&mut self) {
+        // Position the selected node at the top-left of the viewport
+        self.tree_scroll_offset = self.selected_index;
+
+        let depth = self.get_selected_depth();
+        let start_visual_pos = depth * 2; // Assuming 2 spaces per indent
+        self.tree_horizontal_scroll = start_visual_pos;
+    }
+
+    pub fn perform_search(&mut self) {
+        self.search_results.clear();
+        self.current_match_index = 0;
+
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        use fuzzy_matcher::skim::SkimMatcherV2;
+        let matcher = SkimMatcherV2::default();
+
+        let mut results = Vec::new();
+        if let Some(root) = &self.root_node {
+            Self::search_recursive(root, &matcher, &self.search_query, &mut results);
+        }
+        self.search_results = results;
+
+        // Auto-focus first match
+        if !self.search_results.is_empty() {
+            self.jump_to_match(0);
+        }
+    }
+
+    fn search_recursive(
+        node: &RemoteDiagnosticsNode,
+        matcher: &fuzzy_matcher::skim::SkimMatcherV2,
+        query: &str,
+        results: &mut Vec<String>,
+    ) {
+        use fuzzy_matcher::FuzzyMatcher;
+
+        let mut match_found = false;
+        if let Some(desc) = &node.description {
+            if matcher.fuzzy_match(desc, query).is_some() {
+                match_found = true;
+            }
+        }
+        if !match_found {
+            if let Some(w_type) = &node.widget_runtime_type {
+                if matcher.fuzzy_match(w_type, query).is_some() {
+                    match_found = true;
+                }
+            }
+        }
+
+        if match_found {
+            if let Some(id) = Self::get_node_id(node) {
+                results.push(id);
+            }
+        }
+
+        if let Some(children) = &node.children {
+            for child in children {
+                Self::search_recursive(child, matcher, query, results);
+            }
+        }
+    }
+
+    pub fn next_match(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        self.current_match_index = (self.current_match_index + 1) % self.search_results.len();
+        self.jump_to_match(self.current_match_index);
+    }
+
+    pub fn prev_match(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        if self.current_match_index == 0 {
+            self.current_match_index = self.search_results.len() - 1;
+        } else {
+            self.current_match_index -= 1;
+        }
+        self.jump_to_match(self.current_match_index);
+    }
+
+    fn jump_to_match(&mut self, match_index: usize) {
+        if let Some(id) = self.search_results.get(match_index).cloned() {
+            // 1. Expand path to this node
+            self.expand_path_to_node(&id);
+
+            // 2. Find the new visible index of this node
+            if let Some(index) = self.get_visible_index_of_id(&id) {
+                self.selected_index = index;
+
+                // 3. Scroll to show context
+                if index >= 3 {
+                    self.tree_scroll_offset = index - 3;
+                } else {
+                    self.tree_scroll_offset = 0;
+                }
+
+                let depth = self.get_selected_depth();
+                let start_visual_pos = depth * 2;
+                self.tree_horizontal_scroll = start_visual_pos.saturating_sub(6);
+            }
+        }
+    }
+
+    fn expand_path_to_node(&mut self, target_id: &str) {
+        if let Some(root) = &self.root_node {
+            let mut path = Vec::new();
+            if Self::find_path_to_node(root, target_id, &mut path) {
+                for id in path {
+                    self.expanded_ids.insert(id);
+                }
+            }
+        }
+    }
+
+    fn find_path_to_node(
+        node: &RemoteDiagnosticsNode,
+        target_id: &str,
+        path: &mut Vec<String>,
+    ) -> bool {
+        if let Some(id) = Self::get_node_id(node) {
+            if id == target_id {
+                // Don't necessarily need to add the node itself to expanded_ids,
+                // but adding it doesn't hurt (it just expands the node itself).
+                // Usually we want to expand parents.
+                // But let's add it to path so we can expand it if it has children?
+                // Actually, we usually want to see the node, so parents must be expanded.
+                // The node itself being expanded is optional.
+                // Let's add it.
+                // path.push(id); // Optional
+                return true;
+            }
+
+            path.push(id.clone());
+            if let Some(children) = &node.children {
+                for child in children {
+                    if Self::find_path_to_node(child, target_id, path) {
+                        return true;
+                    }
+                }
+            }
+            path.pop();
+        }
+        false
+    }
+
+    fn get_visible_index_of_id(&self, target_id: &str) -> Option<usize> {
+        if let Some(root) = &self.root_node {
+            let mut current_index = 0;
+            return self.find_visible_index_recursive(root, target_id, &mut current_index);
+        }
+        None
+    }
+
+    fn find_visible_index_recursive(
+        &self,
+        node: &RemoteDiagnosticsNode,
+        target_id: &str,
+        current_index: &mut usize,
+    ) -> Option<usize> {
+        if let Some(id) = Self::get_node_id(node) {
+            if id == target_id {
+                return Some(*current_index);
+            }
+
+            *current_index += 1;
+
+            if self.expanded_ids.contains(&id) {
+                if let Some(children) = &node.children {
+                    for child in children {
+                        if let Some(found) =
+                            self.find_visible_index_recursive(child, target_id, current_index)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }

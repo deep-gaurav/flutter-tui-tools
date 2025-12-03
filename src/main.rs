@@ -197,9 +197,40 @@ async fn main() -> Result<()> {
                             }
                             _ => {}
                         }
+                    } else if app_state.focus == app_state::Focus::Search {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app_state.focus = app_state::Focus::Tree;
+                            }
+                            KeyCode::Enter => {
+                                if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    app_state.prev_match();
+                                } else {
+                                    app_state.next_match();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                app_state.search_query.push(c);
+                                app_state.perform_search();
+                            }
+                            KeyCode::Backspace => {
+                                app_state.search_query.pop();
+                                app_state.perform_search();
+                            }
+                            _ => {}
+                        }
                     } else {
                         match key.code {
                             KeyCode::Char('q') => break,
+                            KeyCode::Char('f') => {
+                                if app_state.focus == app_state::Focus::Tree {
+                                    app_state.focus_selected_node();
+                                }
+                            }
+                            KeyCode::Char('/') => {
+                                app_state.focus = app_state::Focus::Search;
+                                app_state.search_query.clear();
+                            }
                             KeyCode::Tab => app_state.cycle_focus(),
                             KeyCode::Up => match app_state.focus {
                                 app_state::Focus::Tree => {
