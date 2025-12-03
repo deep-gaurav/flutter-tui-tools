@@ -12,13 +12,46 @@ use ratatui::{
 pub fn draw(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([
+            Constraint::Length(3),  // App Bar
+            Constraint::Min(0),     // Main Content
+            Constraint::Length(10), // Logs (fixed height or percentage)
+        ])
         .split(f.area());
+
+    // App Bar
+    let app_bar_block = Block::default().borders(Borders::ALL).title("Controls");
+    let app_bar_area = chunks[0];
+
+    let buttons = vec![
+        "Hot Reload (r)",
+        "Hot Restart (R)",
+        "DevTools (v)",
+        "Quit (q)",
+    ];
+
+    let button_constraints: Vec<Constraint> =
+        buttons.iter().map(|_| Constraint::Length(20)).collect();
+    let button_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(button_constraints)
+        .split(app_bar_block.inner(app_bar_area));
+
+    f.render_widget(app_bar_block, app_bar_area);
+
+    for (i, label) in buttons.iter().enumerate() {
+        if i < button_layout.len() {
+            let btn = Paragraph::new(*label)
+                .style(Style::default().fg(Color::Cyan).bg(Color::Black))
+                .alignment(ratatui::layout::Alignment::Center);
+            f.render_widget(btn, button_layout[i]);
+        }
+    }
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
-        .split(chunks[0]);
+        .split(chunks[1]);
 
     // Left: Widget Tree
     tree::draw(f, main_chunks[0], state);
@@ -37,7 +70,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .title("Logs")
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(border_style);
-    let log_area = chunks[1];
+    let log_area = chunks[2];
     let log_height = log_area.height as usize;
 
     // Calculate scroll offset

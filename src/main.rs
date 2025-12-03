@@ -50,6 +50,10 @@ async fn main() -> Result<()> {
     let (tx_selected_isolate, mut rx_selected_isolate) = mpsc::channel::<String>(1);
     let (tx_details_request, mut rx_details_request) = mpsc::channel::<String>(1);
     let (tx_details, mut rx_details) = mpsc::channel::<vm_service::RemoteDiagnosticsNode>(1);
+    let (tx_cmd, rx_cmd) = mpsc::channel::<String>(10);
+    let (tx_refresh, mut rx_refresh) = mpsc::channel::<()>(1);
+
+    app_state.tx_flutter_command = Some(tx_cmd);
 
     // Init logger
     logger::init(tx_log)?;
@@ -60,7 +64,7 @@ async fn main() -> Result<()> {
     let device_id = args.device_id.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = daemon.run(&app_dir, device_id.as_deref()).await {
+        if let Err(e) = daemon.run(&app_dir, device_id.as_deref(), rx_cmd).await {
             log::error!("Flutter daemon error: {}", e);
         }
     });
@@ -137,6 +141,23 @@ async fn main() -> Result<()> {
                                         log::warn!("VM: Received details request but current_isolate_id is None");
                                     }
                                 }
+                                Some(_) = rx_refresh.recv() => {
+                                    if let Some(isolate_id) = &current_isolate_id {
+                                        log::info!("VM: Refreshing tree for isolate {}", isolate_id);
+                                        match client
+                                            .get_root_widget_summary_tree("tui_inspector", isolate_id)
+                                            .await
+                                        {
+                                            Ok(tree) => {
+                                                log::info!("Root Widget refreshed");
+                                                let _ = tx_tree.send(tree).await;
+                                            }
+                                            Err(e) => {
+                                                log::error!("Failed to refresh tree: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
                                 else => {
                                     break;
                                 }
@@ -172,6 +193,10 @@ async fn main() -> Result<()> {
         }
 
         while let Ok(log_entry) = rx_log.try_recv() {
+            // Check for hot reload/restart completion
+            if log_entry.contains("Reloaded") || log_entry.contains("Restarted") {
+                let _ = tx_refresh.try_send(());
+            }
             app_state.add_log(log_entry);
         }
 
@@ -221,7 +246,27 @@ async fn main() -> Result<()> {
                         }
                     } else {
                         match key.code {
-                            KeyCode::Char('q') => break,
+                            KeyCode::Char('q') => {
+                                if let Some(tx) = &app_state.tx_flutter_command {
+                                    let _ = tx.send("q".to_string()).await;
+                                }
+                                break;
+                            }
+                            KeyCode::Char('r') => {
+                                if let Some(tx) = &app_state.tx_flutter_command {
+                                    let _ = tx.send("r".to_string()).await;
+                                }
+                            }
+                            KeyCode::Char('R') => {
+                                if let Some(tx) = &app_state.tx_flutter_command {
+                                    let _ = tx.send("R".to_string()).await;
+                                }
+                            }
+                            KeyCode::Char('v') => {
+                                if let Some(tx) = &app_state.tx_flutter_command {
+                                    let _ = tx.send("v".to_string()).await;
+                                }
+                            }
                             KeyCode::Char('f') => {
                                 if app_state.focus == app_state::Focus::Tree {
                                     app_state.focus_selected_node();
@@ -239,7 +284,7 @@ async fn main() -> Result<()> {
                                         .size()
                                         .map(|r| (r.width, r.height))
                                         .unwrap_or((0, 0));
-                                    let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                                    let tree_height = (rows.saturating_sub(3 + 10)) as usize; // Approx tree height (minus app bar and logs)
                                     let tree_width = (cols as f32 * 0.75) as usize;
                                     app_state.update_tree_scroll(tree_height.saturating_sub(2));
                                     app_state
@@ -269,7 +314,7 @@ async fn main() -> Result<()> {
                                         .size()
                                         .map(|r| (r.width, r.height))
                                         .unwrap_or((0, 0));
-                                    let tree_height = (rows as f32 * 0.7) as usize; // Approx tree height
+                                    let tree_height = (rows.saturating_sub(3 + 10)) as usize; // Approx tree height
                                     let tree_width = (cols as f32 * 0.75) as usize;
                                     app_state.update_tree_scroll(tree_height.saturating_sub(2));
                                     app_state
@@ -302,7 +347,7 @@ async fn main() -> Result<()> {
                                             .size()
                                             .map(|r| (r.width, r.height))
                                             .unwrap_or((0, 0));
-                                        let tree_height = (rows as f32 * 0.7) as usize;
+                                        let tree_height = (rows.saturating_sub(3 + 10)) as usize;
                                         let tree_width = (cols as f32 * 0.75) as usize;
                                         app_state.update_tree_scroll(tree_height.saturating_sub(2));
                                         app_state.ensure_horizontal_visibility(
@@ -351,18 +396,58 @@ async fn main() -> Result<()> {
                                     .size()
                                     .map(|r| (r.width, r.height))
                                     .unwrap_or((0, 0));
-                                // Layout:
-                                // Vertical: 70% Top, 30% Bottom
-                                // Top: 50% Left, 50% Right
-                                let split_y = (rows as f32 * 0.7) as u16;
-                                let split_x = (cols as f32 * 0.5) as u16;
 
-                                if mouse.row < split_y {
+                                // App Bar Click Handling
+                                if mouse.row < 3 {
+                                    // Button width is 20
+                                    let button_index = (mouse.column as usize) / 20;
+                                    match button_index {
+                                        0 => {
+                                            // Hot Reload
+                                            if let Some(tx) = &app_state.tx_flutter_command {
+                                                let _ = tx.send("r".to_string()).await;
+                                            }
+                                        }
+                                        1 => {
+                                            // Hot Restart
+                                            if let Some(tx) = &app_state.tx_flutter_command {
+                                                let _ = tx.send("R".to_string()).await;
+                                            }
+                                        }
+                                        2 => {
+                                            // DevTools
+                                            if let Some(tx) = &app_state.tx_flutter_command {
+                                                let _ = tx.send("v".to_string()).await;
+                                            }
+                                        }
+                                        3 => {
+                                            // Quit
+                                            if let Some(tx) = &app_state.tx_flutter_command {
+                                                let _ = tx.send("q".to_string()).await;
+                                            }
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
+
+                                // Layout:
+                                // App Bar: 3 lines
+                                // Main Content: Remaining - 10
+                                // Logs: 10 lines
+                                let app_bar_height = 3;
+                                let log_height = 10;
+                                let main_height = rows.saturating_sub(app_bar_height + log_height);
+                                let split_y = app_bar_height + main_height;
+                                let split_x = (cols as f32 * 0.75) as u16;
+
+                                if mouse.row >= app_bar_height && mouse.row < split_y {
                                     if mouse.column < split_x {
                                         app_state.focus = app_state::Focus::Tree;
                                         // Handle tree click
-                                        let tree_y = mouse.row.saturating_sub(1); // -1 for top border
-                                        if tree_y < split_y.saturating_sub(2) {
+                                        let tree_y = mouse.row.saturating_sub(app_bar_height + 1); // -1 for top border
+                                        if tree_y < main_height.saturating_sub(2) {
                                             // Check if within content area
                                             let clicked_index =
                                                 tree_y as usize + app_state.tree_scroll_offset;
@@ -373,7 +458,7 @@ async fn main() -> Result<()> {
                                     } else {
                                         app_state.focus = app_state::Focus::Details;
                                     }
-                                } else {
+                                } else if mouse.row >= split_y {
                                     app_state.focus = app_state::Focus::Logs;
                                 }
                             }
@@ -382,12 +467,18 @@ async fn main() -> Result<()> {
                                     .size()
                                     .map(|r| (r.width, r.height))
                                     .unwrap_or((0, 0));
-                                let split_y = (rows as f32 * 0.7) as u16;
-                                let split_x = (cols as f32 * 0.5) as u16;
+                                let app_bar_height = 3;
+                                let log_height = 10;
+                                let main_height = rows.saturating_sub(app_bar_height + log_height);
+                                let split_y = app_bar_height + main_height;
+                                let split_x = (cols as f32 * 0.75) as u16;
 
                                 if mouse.row >= split_y {
                                     app_state.scroll_logs(1);
-                                } else if mouse.row < split_y && mouse.column < split_x {
+                                } else if mouse.row >= app_bar_height
+                                    && mouse.row < split_y
+                                    && mouse.column < split_x
+                                {
                                     app_state.scroll_tree(1);
                                 }
                             }
@@ -396,12 +487,18 @@ async fn main() -> Result<()> {
                                     .size()
                                     .map(|r| (r.width, r.height))
                                     .unwrap_or((0, 0));
-                                let split_y = (rows as f32 * 0.7) as u16;
-                                let split_x = (cols as f32 * 0.5) as u16;
+                                let app_bar_height = 3;
+                                let log_height = 10;
+                                let main_height = rows.saturating_sub(app_bar_height + log_height);
+                                let split_y = app_bar_height + main_height;
+                                let split_x = (cols as f32 * 0.75) as u16;
 
                                 if mouse.row >= split_y {
                                     app_state.scroll_logs(-1);
-                                } else if mouse.row < split_y && mouse.column < split_x {
+                                } else if mouse.row >= app_bar_height
+                                    && mouse.row < split_y
+                                    && mouse.column < split_x
+                                {
                                     app_state.scroll_tree(-1);
                                 }
                             }

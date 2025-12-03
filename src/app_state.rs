@@ -37,6 +37,8 @@ pub struct AppState {
     pub current_match_index: usize,  // Index into search_results
 
     pub focus: Focus,
+
+    pub tx_flutter_command: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl AppState {
@@ -59,20 +61,62 @@ impl AppState {
             search_results: Vec::new(),
             current_match_index: 0,
             focus: Focus::Tree,
+            tx_flutter_command: None,
         }
     }
 
     pub fn set_root_node(&mut self, node: RemoteDiagnosticsNode) {
+        // Capture currently selected node ID
+        let selected_id = self.get_selected_node().and_then(|n| Self::get_node_id(n));
+
         // When we get a new tree, we might want to preserve expansion state if possible.
         // For now, let's just expand the root by default.
         if let Some(id) = Self::get_node_id(&node) {
             self.expanded_ids.insert(id);
         }
         self.root_node = Some(node);
-        // Reset selection on new tree
-        self.selected_index = 0;
-        self.selected_node_details = None;
-        self.tree_scroll_offset = 0;
+
+        // Try to restore selection
+        if let Some(id) = selected_id {
+            // Ensure path is expanded (in case IDs changed or it's a new tree structure)
+            self.expand_path_to_node(&id);
+
+            if let Some(index) = self.get_visible_index_of_id(&id) {
+                self.selected_index = index;
+                // Update scroll to keep it visible
+                self.ensure_selection_visible_after_restore();
+            } else {
+                // Node not found, reset to top
+                self.selected_index = 0;
+                self.tree_scroll_offset = 0;
+                self.selected_node_details = None;
+            }
+        } else {
+            // No previous selection, reset
+            self.selected_index = 0;
+            self.tree_scroll_offset = 0;
+            self.selected_node_details = None;
+        }
+    }
+
+    fn ensure_selection_visible_after_restore(&mut self) {
+        if self.selected_index < self.tree_scroll_offset {
+            self.tree_scroll_offset = self.selected_index;
+        } else {
+            // We don't know the height here, so we can't perfectly scroll to bottom.
+            // But we can try to keep it somewhat centered or just ensure top visibility.
+            // Let's just leave scroll offset alone if it's visible, or move it if it's way off.
+            // Actually, if we just reloaded, the tree structure might be similar.
+            // Let's try to maintain relative position?
+            // For now, let's just ensure it's not above the viewport.
+            // If it's way below, the user will scroll.
+            // Better: use the same logic as jump_to_match
+            if self.selected_index >= 3 {
+                self.tree_scroll_offset = self.selected_index - 3;
+            } else {
+                self.tree_scroll_offset = 0;
+            }
+        }
     }
 
     pub fn get_node_id(node: &RemoteDiagnosticsNode) -> Option<String> {

@@ -14,7 +14,12 @@ impl FlutterDaemon {
         Self { uri_sender }
     }
 
-    pub async fn run(&self, app_dir: &str, device_id: Option<&str>) -> Result<()> {
+    pub async fn run(
+        &self,
+        app_dir: &str,
+        device_id: Option<&str>,
+        mut command_rx: mpsc::Receiver<String>,
+    ) -> Result<()> {
         let mut cmd = Command::new("fvm");
         cmd.arg("flutter")
             .arg("attach")
@@ -23,7 +28,7 @@ impl FlutterDaemon {
             .current_dir(app_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stdin(Stdio::piped());
 
         if let Some(id) = device_id {
             cmd.arg("-d").arg(id);
@@ -33,6 +38,7 @@ impl FlutterDaemon {
 
         let stdout = child.stdout.take().context("Failed to open stdout")?;
         let stderr = child.stderr.take().context("Failed to open stderr")?;
+        let mut stdin = child.stdin.take().context("Failed to open stdin")?;
 
         // Spawn stderr reader
         tokio::spawn(async move {
@@ -63,29 +69,42 @@ impl FlutterDaemon {
         // Matches "available at: http://..."
         let re = Regex::new(r"available at: (http://[\d\.:]+/[^/]+/?)").unwrap();
 
+        use tokio::io::AsyncWriteExt;
+
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
-            if bytes_read == 0 {
-                break;
-            }
+            tokio::select! {
+                bytes_read = reader.read_line(&mut line) => {
+                    match bytes_read {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                log::info!("Flutter Output: {}", trimmed);
 
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            log::info!("Flutter Output: {}", trimmed);
-
-            if let Some(caps) = re.captures(trimmed) {
-                if let Some(uri_match) = caps.get(1) {
-                    let uri = uri_match.as_str().to_string();
-                    // Convert http to ws if necessary, but tungstenite might handle http uri by replacing scheme?
-                    // Usually VM service accepts ws://.
-                    // The output is http://.../
-                    // We should convert it to ws://
-                    let ws_uri = uri.replace("http://", "ws://");
-                    let _ = self.uri_sender.send(ws_uri).await;
+                                if let Some(caps) = re.captures(trimmed) {
+                                    if let Some(uri_match) = caps.get(1) {
+                                        let uri = uri_match.as_str().to_string();
+                                        let ws_uri = uri.replace("http://", "ws://");
+                                        let _ = self.uri_sender.send(ws_uri).await;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Error reading stdout: {}", e);
+                            break;
+                        }
+                    }
+                }
+                Some(cmd_str) = command_rx.recv() => {
+                    log::info!("Sending command to Flutter: {}", cmd_str);
+                    if let Err(e) = stdin.write_all(cmd_str.as_bytes()).await {
+                        log::error!("Failed to write to stdin: {}", e);
+                    }
+                    if let Err(e) = stdin.flush().await {
+                        log::error!("Failed to flush stdin: {}", e);
+                    }
                 }
             }
         }
